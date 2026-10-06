@@ -1,0 +1,36 @@
+[Unit]
+Description=vwsync-api (Vaultwarden member sync REST service)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=vwsync
+Group=vwsync
+ExecStart=/opt/vwsync-api/vwsync-api serve
+EnvironmentFile=/etc/vwsync-api/env
+Restart=on-failure
+RestartSec=5
+# A stop or restart waits for a running sync or confirm to finish. The service allows itself up to
+# 15 minutes for that, systemd's default of 90 seconds would kill it half way.
+TimeoutStopSec=900
+
+# The env file holds the API key and master password: root-owned, group vwsync, mode 0640.
+# Sandboxing. The service only needs outbound HTTPS and its own listening socket.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallFilter=@system-service
+CapabilityBoundingSet=
+
+[Install]
+WantedBy=multi-user.target
