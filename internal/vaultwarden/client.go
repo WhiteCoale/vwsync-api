@@ -1,14 +1,17 @@
-// Package vaultwarden is a small typed client for the Vaultwarden/Bitwarden user API.
+// Package vaultwarden ist ein kleiner, typisierter Client für die Benutzer-API von Vaultwarden/Bitwarden.
 //
-// It authenticates with a personal API key (OAuth2 client_credentials). The key belongs to a normal
-// account that must be owner or admin of the affected organizations. The organization API
-// (/api/public) is not used because it can neither change roles nor confirm members.
+// Er meldet sich mit einem persönlichen API-Key an (OAuth2 client_credentials). Der Key gehört einem
+// normalen Konto, das in den betroffenen Organisationen Owner oder Admin sein muss. Die
+// Organisations-API (/api/public) wird nicht genutzt, weil sie weder Rollen ändern noch Mitglieder
+// bestätigen kann.
 package vaultwarden
 
 import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -17,6 +20,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -25,15 +29,16 @@ import (
 	"vwsync-api/internal/model"
 )
 
-// Credentials is the personal API key of the managing account.
+// Credentials ist der persönliche API-Key des verwaltenden Kontos.
 type Credentials struct {
 	ClientID     string
 	ClientSecret string
-	// MasterPassword is optional and only needed for Confirm.
+	// MasterPassword ist optional und nur für Confirm und CreateOrganization nötig.
 	MasterPassword string
 }
 
-// APIError is a failed call. It carries the server's answer, never the request body (it may hold secrets).
+// APIError ist ein fehlgeschlagener Aufruf. Er enthält die Antwort des Servers, nie den Request-Body,
+// denn der kann Secrets enthalten.
 type APIError struct {
 	Method, Path string
 	Status       int
@@ -47,13 +52,14 @@ func (e *APIError) Error() string {
 	return fmt.Sprintf("%s %s -> %d: %s", e.Method, e.Path, e.Status, e.Body)
 }
 
-// LoginData is what "confirm" needs from the token response to unlock the account's keys.
+// LoginData ist das, was confirm aus der Token-Antwort braucht, um die Schlüssel des Kontos zu entsperren.
 type LoginData struct {
 	EncUserKey    string
 	EncPrivateKey string
 	KDF           crypto.KDFParams
-	// Problem is set when the login response had key material in an unexpected shape. It does not
-	// break the login, because only confirm and org creation need the keys. Vault reports it.
+	// Problem ist gesetzt, wenn die Login-Antwort Schlüsselmaterial in unerwarteter Form enthielt. Der
+	// Login scheitert daran nicht, weil nur confirm und das Anlegen von Orgs die Schlüssel brauchen.
+	// Vault meldet das Problem.
 	Problem string
 }
 
@@ -62,9 +68,9 @@ type Client struct {
 	base  string
 	creds Credentials
 
-	log *slog.Logger // optional, debug output only
+	log *slog.Logger // optional, nur für Debug-Ausgaben
 
-	mu      sync.Mutex // guards the session fields below
+	mu      sync.Mutex // schützt die Sitzungsfelder darunter
 	token   string
 	expires time.Time
 	login   LoginData
@@ -77,14 +83,14 @@ func New(httpClient *http.Client, baseURL string, creds Credentials) *Client {
 	return &Client{http: httpClient, base: strings.TrimRight(baseURL, "/"), creds: creds}
 }
 
-// WithLogger makes the client log every call at debug level: method, path, status and duration.
-// Never bodies, headers or tokens.
+// WithLogger lässt den Client jeden Aufruf auf Debug-Level protokollieren, mit Methode, Pfad, Status
+// und Dauer. Nie mit Bodies, Headern oder Tokens.
 func (c *Client) WithLogger(l *slog.Logger) *Client {
 	c.log = l
 	return c
 }
 
-// Login returns the key material of the current session, logging in first if needed.
+// Login liefert das Schlüsselmaterial der aktuellen Sitzung und meldet sich vorher an, falls nötig.
 func (c *Client) Login(ctx context.Context) (LoginData, error) {
 	if _, err := c.bearer(ctx, false); err != nil {
 		return LoginData{}, err
@@ -94,8 +100,9 @@ func (c *Client) Login(ctx context.Context) (LoginData, error) {
 	return c.login, nil
 }
 
-// Profile reads the API account's address and the organizations it manages with a single request.
-// Organizations are limited to those where the account is a confirmed, enabled owner or admin.
+// Profile liest die Adresse des API-Kontos und die verwalteten Organisationen mit einem einzigen
+// Request. Es zählen nur Organisationen, in denen das Konto bestätigter Owner oder Admin ist und die
+// aktiv sind.
 func (c *Client) Profile(ctx context.Context) (model.Profile, error) {
 	var p struct {
 		Email         string `json:"email"`
@@ -111,7 +118,7 @@ func (c *Client) Profile(ctx context.Context) (model.Profile, error) {
 	if err := c.api(ctx, "GET", "/accounts/profile", nil, &p); err != nil {
 		return model.Profile{}, err
 	}
-	orgs := []model.Organization{} // not nil: an empty list must marshal as [] and not as null
+	orgs := []model.Organization{} // nicht nil, eine leere Liste muss als [] serialisiert werden, nicht als null
 	for _, o := range p.Organizations {
 		isAdmin := o.Type == int(model.Owner) || o.Type == int(model.Admin)
 		if isAdmin && o.Status == int(model.Confirmed) && (o.Enabled == nil || *o.Enabled) {
@@ -121,19 +128,20 @@ func (c *Client) Profile(ctx context.Context) (model.Profile, error) {
 	return model.Profile{Email: strings.ToLower(p.Email), Orgs: orgs}, nil
 }
 
-// SelfEmail is the managing account's address, lower case. The planner never touches this account.
+// SelfEmail ist die Adresse des verwaltenden Kontos in Kleinbuchstaben. Der Planer fasst dieses Konto
+// nie an.
 func (c *Client) SelfEmail(ctx context.Context) (string, error) {
 	p, err := c.Profile(ctx)
 	return p.Email, err
 }
 
-// AdminOrganizations lists organizations where the account is a confirmed, enabled owner or admin.
+// AdminOrganizations listet die aktiven Organisationen, in denen das Konto bestätigter Owner oder Admin ist.
 func (c *Client) AdminOrganizations(ctx context.Context) ([]model.Organization, error) {
 	p, err := c.Profile(ctx)
 	return p.Orgs, err
 }
 
-// OrgUsers lists all members of an organization with role and status.
+// OrgUsers listet alle Mitglieder einer Organisation mit Rolle und Status.
 func (c *Client) OrgUsers(ctx context.Context, orgID string) ([]model.Member, error) {
 	var r struct {
 		Data []struct {
@@ -165,7 +173,7 @@ func (c *Client) OrgUsers(ctx context.Context, orgID string) ([]model.Member, er
 	return members, nil
 }
 
-// Invite invites a person by e-mail. No individual collections are granted.
+// Invite lädt eine Person per E-Mail ein. Einzelne Sammlungen werden dabei nicht freigegeben.
 func (c *Client) Invite(ctx context.Context, orgID, email string, role model.Role) error {
 	body := roleFields(role)
 	body["emails"] = []string{email}
@@ -174,8 +182,9 @@ func (c *Client) Invite(ctx context.Context, orgID, email string, role model.Rol
 	return c.api(ctx, "POST", "/organizations/"+url.PathEscape(orgID)+"/users/invite", body, nil)
 }
 
-// ChangeRole changes a member's role. The PUT endpoint REPLACES the collection assignment, so the
-// current assignment is read first and sent back unchanged. Sending empty lists would revoke access.
+// ChangeRole ändert die Rolle eines Mitglieds. Der PUT-Endpunkt ERSETZT die Zuordnung zu Sammlungen.
+// Deshalb wird die aktuelle Zuordnung zuerst gelesen und unverändert zurückgesendet. Leere Listen
+// würden den Zugriff entziehen.
 func (c *Client) ChangeRole(ctx context.Context, orgID, memberID string, role model.Role) error {
 	path := "/organizations/" + url.PathEscape(orgID) + "/users/" + url.PathEscape(memberID)
 	var cur struct {
@@ -197,11 +206,12 @@ func orEmpty(l []any) []any {
 	return l
 }
 
-// roleFields are the request fields that carry a role.
+// roleFields sind die Request-Felder, die eine Rolle beschreiben.
 //
-// Vaultwarden derives "access all collections" from the role and ignores a client-sent accessAll: it is
-// on for owner and admin, and for the custom role when all three collection permissions are set. The
-// custom role is sent as type 4, a manager as type 3 (no permissions, so no access to all collections).
+// Vaultwarden leitet "Zugriff auf alle Sammlungen" aus der Rolle ab und ignoriert ein vom Client
+// gesendetes accessAll. Der Zugriff ist an für Owner und Admin sowie für die Rolle custom, wenn alle
+// drei Sammlungs-Berechtigungen gesetzt sind. Die Rolle custom wird als Typ 4 gesendet, ein Manager als
+// Typ 3 (ohne Berechtigungen, also ohne Zugriff auf alle Sammlungen).
 func roleFields(role model.Role) map[string]any {
 	f := map[string]any{"type": int(role), "accessAll": role == model.Owner || role == model.Admin || role == model.Custom}
 	if role == model.Custom {
@@ -224,14 +234,15 @@ func roleFields(role model.Role) map[string]any {
 	return f
 }
 
-// Remove removes a member, including pending invitations.
+// Remove entfernt ein Mitglied, auch eines mit offener Einladung.
 func (c *Client) Remove(ctx context.Context, orgID, memberID string) error {
 	return c.api(ctx, "DELETE", "/organizations/"+url.PathEscape(orgID)+"/users/"+url.PathEscape(memberID), nil, nil)
 }
 
-// Confirm confirms a member whose status is "accepted". The server does not know the organization
-// key (end-to-end encryption), so the admin encrypts it with the new member's public key.
-// The public key is looked up by USER id, not by membership id.
+// Confirm bestätigt ein Mitglied mit Status "accepted". Der Server kennt den Organisations-Schlüssel
+// nicht (Ende-zu-Ende-Verschlüsselung), deshalb verschlüsselt ihn der Admin mit dem öffentlichen
+// Schlüssel des neuen Mitglieds. Der öffentliche Schlüssel wird über die USER-ID abgefragt, nicht
+// über die Mitgliedschafts-ID.
 func (c *Client) Confirm(ctx context.Context, orgID string, m model.Member, orgKey []byte) error {
 	if m.UserID == "" {
 		return fmt.Errorf("member %s has no user id yet and cannot be confirmed", m.Email)
@@ -250,9 +261,10 @@ func (c *Client) Confirm(ctx context.Context, orgID string, m model.Member, orgK
 		map[string]any{"key": key}, nil)
 }
 
-// CreateOrganization creates an organization owned by the API account. Bitwarden is end-to-end
-// encrypted, so this client generates the organization key and key pair itself (needs the master
-// password, like Confirm). Names are not unique on the server: callers must check for duplicates.
+// CreateOrganization legt eine Organisation an, deren Owner das API-Konto wird. Bitwarden ist
+// Ende-zu-Ende-verschlüsselt, deshalb erzeugt dieser Client Organisations-Schlüssel und Schlüsselpaar
+// selbst. Dafür braucht er wie Confirm das Master-Passwort. Namen sind auf dem Server nicht eindeutig,
+// Aufrufer müssen selbst auf Duplikate prüfen.
 func (c *Client) CreateOrganization(ctx context.Context, name, billingEmail string) (model.Organization, error) {
 	vault, err := c.Vault(ctx)
 	if err != nil {
@@ -276,7 +288,7 @@ func (c *Client) CreateOrganization(ctx context.Context, name, billingEmail stri
 		"collectionName": keys.CollectionName,
 		"key":            keys.Key,
 		"keys":           map[string]string{"publicKey": keys.PublicKey, "encryptedPrivateKey": keys.EncryptedPrivateKey},
-		"planType":       0, // ignored by Vaultwarden, but the field is required
+		"planType":       0, // ignoriert Vaultwarden, das Feld ist aber Pflicht
 	}, &created)
 	if err != nil {
 		return model.Organization{}, err
@@ -287,7 +299,8 @@ func (c *Client) CreateOrganization(ctx context.Context, name, billingEmail stri
 	return model.Organization{ID: created.ID, Name: created.Name, EncryptedKey: keys.Key}, nil
 }
 
-// api calls /api{path}. A 401 triggers one fresh login and one retry, because the token may have expired.
+// api ruft /api{path} auf. Ein 401 löst einen neuen Login und einen zweiten Versuch aus, weil das Token
+// abgelaufen sein kann.
 func (c *Client) api(ctx context.Context, method, path string, body, out any) error {
 	for attempt := 0; ; attempt++ {
 		token, err := c.bearer(ctx, attempt > 0)
@@ -303,7 +316,8 @@ func (c *Client) api(ctx context.Context, method, path string, body, out any) er
 	}
 }
 
-// bearer returns a valid access token, logging in when none exists, it is about to expire, or force is set.
+// bearer liefert ein gültiges Access-Token. Es meldet sich an, wenn keins existiert, das vorhandene
+// bald abläuft oder force gesetzt ist.
 func (c *Client) bearer(ctx context.Context, force bool) (string, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -318,7 +332,7 @@ func (c *Client) bearer(ctx context.Context, force bool) (string, error) {
 		"client_secret": {c.creds.ClientSecret},
 		"deviceType":    {"21"},
 		"deviceName":    {"vwsync-api"},
-		// Constant per API key so the server does not register a new device on every login.
+		// Pro API-Key konstant, damit der Server nicht bei jedem Login ein neues Gerät registriert.
 		"deviceIdentifier": {deviceID(c.creds.ClientID)},
 	}
 	var r map[string]json.RawMessage
@@ -329,7 +343,7 @@ func (c *Client) bearer(ctx context.Context, force bool) (string, error) {
 		if v, ok := r[name]; ok {
 			return v
 		}
-		return r[strings.ToLower(name[:1])+name[1:]] // some server versions use "key", others "Key"
+		return r[strings.ToLower(name[:1])+name[1:]] // manche Serverversionen schreiben "key", andere "Key"
 	}
 	problem := ""
 	str := func(name string) string {
@@ -375,7 +389,7 @@ func (c *Client) bearer(ctx context.Context, force bool) (string, error) {
 	return c.token, nil
 }
 
-// do performs one HTTP request. HTTP >= 400 and network errors become an *APIError.
+// do führt einen HTTP-Request aus. Statuscodes ab 400 und Netzwerkfehler werden zu *APIError.
 func (c *Client) do(ctx context.Context, method, path, token string, jsonBody any, form url.Values, out any) error {
 	var body io.Reader
 	contentType := ""
@@ -412,10 +426,10 @@ func (c *Client) do(ctx context.Context, method, path, token string, jsonBody an
 		c.log.Debug("vaultwarden call", "method", method, "path", path, "status", status, "ms", time.Since(start).Milliseconds())
 	}
 	if err != nil {
-		// url.Error repeats the URL only, no body, so it is safe to show.
+		// url.Error wiederholt nur die URL, keinen Body, und darf deshalb angezeigt werden.
 		return &APIError{Method: method, Path: path, Body: err.Error()}
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
 	if err != nil {
 		return &APIError{Method: method, Path: path, Body: err.Error()}
@@ -433,18 +447,42 @@ func (c *Client) do(ctx context.Context, method, path, token string, jsonBody an
 	return nil
 }
 
-// deviceID derives a stable UUID-shaped device id from the client id. It is only an identifier, not a
-// secret, but SHA-256 keeps security scanners quiet.
+// deviceID leitet aus der Client-ID eine stabile Geräte-ID in UUID-Form ab. Sie ist nur ein Bezeichner
+// und kein Secret. SHA-256 statt eines schwächeren Hashs hält Sicherheits-Scanner ruhig.
 func deviceID(clientID string) string {
 	sum := sha256.Sum256([]byte("vwsync/" + clientID))
 	h := hex.EncodeToString(sum[:])
 	return h[0:8] + "-" + h[8:12] + "-" + h[12:16] + "-" + h[16:20] + "-" + h[20:32]
 }
 
-// truncate shortens s to at most n bytes without cutting a multi-byte character in half.
+// truncate kürzt s auf höchstens n Byte, ohne ein Mehrbyte-Zeichen zu zerschneiden.
 func truncate(s string, n int) string {
 	if len(s) <= n {
 		return s
 	}
 	return strings.ToValidUTF8(s[:n], "")
+}
+
+// HTTPClient liefert den HTTP-Client für Vaultwarden. caFile ist eine optionale PEM-Datei, deren
+// Zertifizierungsstellen zusätzlich zu denen des Systems vertraut wird, für einen Server mit interner CA.
+func HTTPClient(caFile string, timeout time.Duration) (*http.Client, error) {
+	client := &http.Client{Timeout: timeout}
+	if caFile == "" {
+		return client, nil
+	}
+	pemData, err := os.ReadFile(caFile) //nolint:gosec // der Pfad stammt aus der Konfiguration des Betreibers
+	if err != nil {
+		return nil, fmt.Errorf("reading VW_CA_FILE: %w", err)
+	}
+	pool, err := x509.SystemCertPool()
+	if err != nil || pool == nil {
+		pool = x509.NewCertPool()
+	}
+	if !pool.AppendCertsFromPEM(pemData) {
+		return nil, fmt.Errorf("VW_CA_FILE %s contains no PEM certificate", caFile)
+	}
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.TLSClientConfig = &tls.Config{RootCAs: pool, MinVersion: tls.VersionTLS12}
+	client.Transport = transport
+	return client, nil
 }

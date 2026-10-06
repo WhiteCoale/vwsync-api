@@ -14,7 +14,7 @@ import (
 )
 
 func TestPBKDF2KnownAnswer(t *testing.T) {
-	// PBKDF2-HMAC-SHA256, password "password", salt "salt", 1 iteration (the e-mail is the salt).
+	// PBKDF2-HMAC-SHA256, Passwort "password", Salt "salt", 1 Iteration (die E-Mail ist das Salt).
 	got, err := DeriveMasterKey("password", "  SALT ", KDFParams{Type: KDFPBKDF2, Iterations: 1})
 	if err != nil {
 		t.Fatal(err)
@@ -135,8 +135,8 @@ func TestUnlockFullChain(t *testing.T) {
 	const password, email = "correct horse", "Admin@Example.com"
 	kdf := KDFParams{Type: KDFPBKDF2, Iterations: 10}
 
-	// Build what the server would hand out: user key under the stretched master key,
-	// private key under the user key, org key under the account's public key.
+	// Baut nach, was der Server liefern würde: User-Key unter dem gestreckten Master-Key, privater
+	// Schlüssel unter dem User-Key, Org-Schlüssel unter dem öffentlichen Schlüssel des Kontos.
 	mk, _ := DeriveMasterKey(password, email, kdf)
 	stretched, _ := StretchMasterKey(mk)
 	userKey := newKey(t)

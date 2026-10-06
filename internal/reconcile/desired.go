@@ -1,4 +1,4 @@
-// Package reconcile computes and applies the difference between a desired and the actual membership.
+// Package reconcile berechnet den Unterschied zwischen Soll- und Ist-Mitgliedschaft und setzt ihn um.
 package reconcile
 
 import (
@@ -10,22 +10,23 @@ import (
 	"vwsync-api/internal/model"
 )
 
-// DesiredInput is the JSON body of a sync request:
+// DesiredInput ist der JSON-Body eines Sync-Requests.
 //
 //	{"orgs": {"Team Alpha": {"members": {"alice@example.com": "admin"}}}}
 //
-// The org key is a name or an id.
+// Der Schlüssel einer Org ist ihr Name oder ihre ID.
 type DesiredInput struct {
 	Orgs map[string]struct {
 		Members map[string]model.Role `json:"members"`
 	} `json:"orgs"`
 }
 
-// Desired maps org key -> lower-case e-mail -> role. After Parse, every e-mail is valid and unique.
+// Desired ordnet Org-Schlüssel -> E-Mail in Kleinbuchstaben -> Rolle zu. Nach Parse ist jede E-Mail
+// gültig und eindeutig.
 type Desired map[string]map[string]model.Role
 
-// Parse validates the input completely, so a bad request fails before the first API call.
-// An org with an empty member list is kept: it means "remove everyone".
+// Parse prüft die Eingabe vollständig, damit ein fehlerhafter Request vor dem ersten API-Aufruf
+// scheitert. Eine Org mit leerer Mitgliederliste bleibt erhalten, sie bedeutet "alle entfernen".
 func (in DesiredInput) Parse() (Desired, error) {
 	out := Desired{}
 	for orgKey, body := range in.Orgs {
@@ -45,7 +46,7 @@ func (in DesiredInput) Parse() (Desired, error) {
 	return out, nil
 }
 
-// OrgKeys returns the org keys in a stable order.
+// OrgKeys liefert die Org-Schlüssel in stabiler Reihenfolge.
 func (d Desired) OrgKeys() []string {
 	keys := make([]string, 0, len(d))
 	for k := range d {

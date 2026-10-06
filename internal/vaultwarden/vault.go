@@ -8,11 +8,13 @@ import (
 	"vwsync-api/internal/crypto"
 )
 
-// ErrNoMasterPassword means the service was started without VW_MASTER_PASSWORD, so it cannot confirm members.
+// ErrNoMasterPassword bedeutet, dass der Dienst ohne VW_MASTER_PASSWORD gestartet wurde und deshalb
+// weder Mitglieder bestätigen noch Organisationen anlegen kann.
 var ErrNoMasterPassword = errors.New("confirm is not configured: VW_MASTER_PASSWORD is not set")
 
-// Vault unlocks the account's keys on first use and keeps them in memory afterwards.
-// The unlock is lazy because PBKDF2 with 600k rounds is expensive and only confirm needs it.
+// Vault entsperrt die Schlüssel des Kontos beim ersten Gebrauch und hält sie danach im Speicher.
+// Das Entsperren geschieht erst bei Bedarf, weil die Schlüsselableitung teuer ist und nur confirm
+// und das Anlegen von Organisationen sie brauchen.
 func (c *Client) Vault(ctx context.Context) (*crypto.KeyVault, error) {
 	if c.creds.MasterPassword == "" {
 		return nil, ErrNoMasterPassword

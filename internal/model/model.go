@@ -1,4 +1,4 @@
-// Package model holds the value types shared by the Vaultwarden client and the reconcile logic.
+// Package model enthält die Werttypen, die der Vaultwarden-Client und die Abgleichslogik gemeinsam nutzen.
 package model
 
 import (
@@ -7,7 +7,7 @@ import (
 	"strings"
 )
 
-// Role is a member's role in an organization. The numbers are the API's "type" values.
+// Role ist die Rolle eines Mitglieds in einer Organisation. Die Zahlen sind die "type"-Werte der API.
 type Role int
 
 const (
@@ -15,14 +15,14 @@ const (
 	Admin   Role = 1
 	User    Role = 2
 	Manager Role = 3
-	// Custom is the custom role with "Manage all collections": create, edit and delete any collection.
-	// Vaultwarden has no other kind of custom role.
+	// Custom ist die benutzerdefinierte Rolle mit "Alle Sammlungen verwalten". Sie darf beliebige
+	// Sammlungen anlegen, bearbeiten und löschen. Andere benutzerdefinierte Rollen kennt Vaultwarden nicht.
 	Custom Role = 4
-	// Unknown is any type this tool does not know. It cannot be assigned through a desired state.
+	// Unknown steht für jeden Typ, den der Dienst nicht kennt. Er lässt sich nicht als Soll-Rolle setzen.
 	Unknown Role = 99
 )
 
-// ParseRole reads a role name from a desired state.
+// ParseRole liest einen Rollennamen aus einem Soll-Zustand.
 func ParseRole(name string) (Role, error) {
 	switch strings.ToLower(strings.TrimSpace(name)) {
 	case "owner":
@@ -39,16 +39,17 @@ func ParseRole(name string) (Role, error) {
 	return 0, fmt.Errorf("unknown role %q (allowed: owner, admin, manager, custom, user)", name)
 }
 
-// RoleFromAPI maps the API's "type" and the member's collection permissions to a role.
+// RoleFromAPI bildet den "type" der API und die Sammlungs-Berechtigungen eines Mitglieds auf eine Rolle ab.
 //
-// Vaultwarden stores a Manager as type 3 but reports it as type 4 ("Custom"), because current Bitwarden
-// clients no longer know the Manager type. Type 3 and 4 therefore mean the same thing, and the three
-// collection permissions tell the two roles apart:
+// Vaultwarden speichert einen Manager als Typ 3, meldet ihn aber als Typ 4 ("Custom"), weil aktuelle
+// Bitwarden-Clients den Manager-Typ nicht mehr kennen. Typ 3 und 4 bedeuten daher dasselbe. Die drei
+// Sammlungs-Berechtigungen unterscheiden die beiden Rollen.
 //
-//	manager: no collection permissions
-//	custom:  create, edit and delete any collection ("Manage all collections")
+//	manager: keine Sammlungs-Berechtigungen
+//	custom:  beliebige Sammlungen anlegen, bearbeiten und löschen ("Alle Sammlungen verwalten")
 //
-// Without this, every manager would look like a role mismatch and be "changed" on each sync.
+// Ohne diese Zuordnung sähe jeder Manager wie eine Rollenabweichung aus und würde bei jedem Sync
+// erneut "geändert".
 func RoleFromAPI(t int, manageAllCollections bool) Role {
 	switch Role(t) {
 	case Owner, Admin, User:
@@ -93,8 +94,8 @@ func (r *Role) UnmarshalJSON(b []byte) error {
 	return nil
 }
 
-// Status is the membership lifecycle:
-// Invited -> Accepted (user accepts) -> Confirmed (admin confirms).
+// Status ist der Lebenszyklus einer Mitgliedschaft.
+// Invited (noch nicht registriert) -> Accepted (registriert) -> Confirmed (vom Dienst bestätigt).
 type Status int
 
 const (
@@ -104,7 +105,8 @@ const (
 	Confirmed Status = 2
 )
 
-// StatusFromAPI maps the API value. Unknown values become Invited so nothing is confirmed by accident.
+// StatusFromAPI bildet den API-Wert ab. Unbekannte Werte werden zu Invited, damit nie versehentlich
+// jemand bestätigt wird.
 func StatusFromAPI(s int) Status {
 	switch Status(s) {
 	case Revoked, Invited, Accepted, Confirmed:
@@ -127,27 +129,27 @@ func (s Status) String() string {
 
 func (s Status) MarshalText() ([]byte, error) { return []byte(s.String()), nil }
 
-// Member is a snapshot of one organization membership. Email is always lower case.
+// Member ist eine Momentaufnahme einer Mitgliedschaft. Email ist immer klein geschrieben.
 type Member struct {
 	ID     string `json:"id"`
 	Email  string `json:"email"`
 	Role   Role   `json:"role"`
 	Status Status `json:"status"`
-	// UserID is the account id, needed to fetch the public key. Not the membership id.
+	// UserID ist die Konto-ID, nötig zum Abruf des öffentlichen Schlüssels. Nicht die Mitgliedschafts-ID.
 	UserID string `json:"-"`
 }
 
-// Organization is an organization the API account may manage.
+// Organization ist eine Organisation, die das API-Konto verwalten darf.
 type Organization struct {
 	ID   string `json:"id"`
 	Name string `json:"name"`
-	// EncryptedKey is the organization key, encrypted for the API account. Only confirm needs it.
+	// EncryptedKey ist der Organisations-Schlüssel, verschlüsselt für das API-Konto. Nur confirm braucht ihn.
 	EncryptedKey string `json:"-"`
 }
 
-// Profile is what one /accounts/profile call yields: the API account's address and the organizations
-// it may manage.
+// Profile ist das Ergebnis eines Aufrufs von /accounts/profile. Es enthält die Adresse des API-Kontos
+// und die Organisationen, die es verwalten darf.
 type Profile struct {
-	Email string // lower case
+	Email string // klein geschrieben
 	Orgs  []Organization
 }

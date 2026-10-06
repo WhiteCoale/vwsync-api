@@ -22,13 +22,13 @@ import (
 
 type call struct{ method, path, body string }
 
-// fakeVW is a minimal Vaultwarden. handlers maps "METHOD /path" to a JSON answer.
+// fakeVW ist ein minimales Vaultwarden. handlers ordnet "METHODE /pfad" eine JSON-Antwort zu.
 type fakeVW struct {
 	calls    []call
 	logins   atomic.Int32
 	handlers map[string]string
 	login    map[string]any
-	reject   atomic.Int32 // number of upcoming /api calls to answer with 401
+	reject   atomic.Int32 // Anzahl der nächsten /api-Aufrufe, die mit 401 beantwortet werden
 }
 
 func (f *fakeVW) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -45,7 +45,7 @@ func (f *fakeVW) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if r.Header.Get("Authorization") != "Bearer tok" || f.reject.Add(-1) >= 0 {
-		http.Error(w, "unauthorized", 401)
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
 	if h, ok := f.handlers[r.Method+" "+r.URL.Path]; ok {
@@ -220,7 +220,7 @@ func TestConfirmUsesUserIDForPublicKey(t *testing.T) {
 func TestServerErrorMessageHasNoRequestBody(t *testing.T) {
 	c, f := newFake(t, good)
 	f.handlers["GET /api/organizations/o1/users/m1"] = `{}`
-	// no PUT handler -> 404
+	// kein PUT-Handler, also 404
 	err := c.ChangeRole(context.Background(), "o1", "m1", model.Admin)
 	var ae *APIError
 	if err == nil || !errors.As(err, &ae) || ae.Status != 404 || strings.Contains(err.Error(), "accessAll") {
@@ -230,7 +230,7 @@ func TestServerErrorMessageHasNoRequestBody(t *testing.T) {
 
 func TestVaultNeedsMasterPassword(t *testing.T) {
 	c, _ := newFake(t, good)
-	if _, err := c.Vault(context.Background()); err != ErrNoMasterPassword {
+	if _, err := c.Vault(context.Background()); !errors.Is(err, ErrNoMasterPassword) {
 		t.Fatalf("%v", err)
 	}
 }

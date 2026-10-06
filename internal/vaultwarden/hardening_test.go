@@ -11,7 +11,7 @@ import (
 )
 
 func TestTruncateNeverSplitsACharacter(t *testing.T) {
-	// 150 two-byte letters are 300 bytes. One ASCII byte in front puts the cut inside a character.
+	// 150 Zwei-Byte-Buchstaben sind 300 Byte. Ein ASCII-Byte davor legt den Schnitt in ein Zeichen.
 	s := "a" + strings.Repeat("ä", 150)
 	got := truncate(s, 300)
 	if !utf8.ValidString(got) || len(got) > 300 {
@@ -52,7 +52,8 @@ func TestDebugLogShowsCallsButNeverSecrets(t *testing.T) {
 			t.Fatalf("%q leaked into the debug log:\n%s", secret, out)
 		}
 	}
-	// The access token the fake server hands out is "tok". Match the whole word, "token" is in a path.
+	// Das Access-Token des Testservers lautet "tok". Geprüft wird das ganze Wort, denn "token" steht
+	// in einem Pfad.
 	if regexp.MustCompile(`\btok\b`).MatchString(out) {
 		t.Fatalf("access token leaked into the debug log:\n%s", out)
 	}
@@ -60,7 +61,7 @@ func TestDebugLogShowsCallsButNeverSecrets(t *testing.T) {
 
 func TestLoginWithOddKeyFieldsStillWorksButConfirmSaysWhy(t *testing.T) {
 	c, f := newFake(t, Credentials{ClientID: "user.1", ClientSecret: "s3cret", MasterPassword: "pw"})
-	f.login["KdfIterations"] = "600000" // a string where a number is expected
+	f.login["KdfIterations"] = "600000" // eine Zeichenkette, wo eine Zahl erwartet wird
 	f.handlers["GET /api/accounts/profile"] = `{"email":"a@x.io"}`
 
 	ld, err := c.Login(context.Background())

@@ -12,16 +12,14 @@ import (
 	"strings"
 	"sync"
 	"testing"
-	"time"
-
-	"golang.org/x/crypto/bcrypt"
 
 	"vwsync-api/internal/auth"
 	"vwsync-api/internal/model"
 	"vwsync-api/internal/reconcile"
 )
 
-const testPassword = "a-long-test-password"
+// testKey ist der Zugangsschlüssel, den der Testdienst akzeptiert.
+const testKey = "vwsk_" + "T3stKeyT3stKeyT3stKeyT3stKeyT3stKeyT3stKey1"
 
 type fakeDir struct {
 	mu       sync.Mutex
@@ -29,10 +27,10 @@ type fakeDir struct {
 	members  map[string][]model.Member
 	writes   []string
 	noVault  bool
-	block    chan struct{} // when set, Invite waits for it
+	block    chan struct{} // wenn gesetzt, wartet Invite darauf
 	started  chan struct{}
 	failMail string
-	panicOn  bool // AdminOrganizations panics, to test the recover handler
+	panicOn  bool // AdminOrganizations löst einen Panic aus, für den Test des Recover-Handlers
 }
 
 func (f *fakeDir) SelfEmail(context.Context) (string, error) { return "me@x.io", nil }
@@ -112,15 +110,10 @@ func newEnv(t *testing.T, dir *fakeDir) env {
 	return newEnvLog(t, dir, io.Discard)
 }
 
-// newEnvLog is newEnv with the service log written to w, for tests that check what is logged.
+// newEnvLog ist newEnv mit dem Log des Dienstes in w, für Tests, die das Log prüfen.
 func newEnvLog(t *testing.T, dir *fakeDir, w io.Writer) env {
 	t.Helper()
-	hb, err := bcrypt.GenerateFromPassword([]byte(testPassword), bcrypt.MinCost) // production cost is far too slow for tests
-	hash := string(hb)
-	if err != nil {
-		t.Fatal(err)
-	}
-	a, err := auth.New("svc", hash, []byte(strings.Repeat("k", 32)), time.Minute)
+	a, err := auth.ParseHashes(auth.HashKey(testKey))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -134,27 +127,16 @@ func (e env) do(method, path, token, body string) *httptest.ResponseRecorder {
 		req.Header.Set("Authorization", "Bearer "+token)
 	}
 	req.Header.Set("X-Real-IP", "10.0.0.1")
-	req.RemoteAddr = "127.0.0.1:50000" // nginx on the same host
+	req.RemoteAddr = "127.0.0.1:50000" // nginx auf demselben Host
 	rec := httptest.NewRecorder()
 	e.h.ServeHTTP(rec, req)
 	return rec
 }
 
+// token liefert den Zugangsschlüssel, den jeder Test als Bearer-Token sendet.
 func (e env) token(t *testing.T) string {
 	t.Helper()
-	rec := e.do("POST", "/v1/auth/login", "", `{"username":"svc","password":"`+testPassword+`"}`)
-	if rec.Code != 200 {
-		t.Fatalf("login: %d %s", rec.Code, rec.Body)
-	}
-	var r struct {
-		AccessToken string `json:"access_token"`
-		TokenType   string `json:"token_type"`
-	}
-	_ = json.Unmarshal(rec.Body.Bytes(), &r)
-	if r.TokenType != "Bearer" || r.AccessToken == "" {
-		t.Fatalf("%s", rec.Body)
-	}
-	return r.AccessToken
+	return testKey
 }
 
 func decode(t *testing.T, rec *httptest.ResponseRecorder) map[string]any {
@@ -174,7 +156,7 @@ func TestHealthzNeedsNoAuth(t *testing.T) {
 
 func TestEveryV1RouteRequiresToken(t *testing.T) {
 	e := newEnv(t, newDir())
-	for _, r := range [][2]string{{"GET", "/v1/orgs"}, {"GET", "/v1/orgs/Team/members"}, {"GET", "/v1/export"}, {"POST", "/v1/sync"}, {"POST", "/v1/confirm"}} {
+	for _, r := range [][2]string{{"GET", "/v1/orgs"}, {"GET", "/v1/orgs/Team/members"}, {"GET", "/v1/export"}, {"POST", "/v1/sync?dry_run=true"}, {"POST", "/v1/confirm?dry_run=true"}} {
 		if rec := e.do(r[0], r[1], "", "{}"); rec.Code != 401 || rec.Header().Get("WWW-Authenticate") == "" {
 			t.Errorf("%v without token: %d", r, rec.Code)
 		}
@@ -184,40 +166,11 @@ func TestEveryV1RouteRequiresToken(t *testing.T) {
 	}
 }
 
-func TestLoginRejectsWrongCredentialsAndRateLimits(t *testing.T) {
-	e := newEnv(t, newDir())
-	for i := 0; i < loginFailuresPerMin; i++ {
-		if rec := e.do("POST", "/v1/auth/login", "", `{"username":"svc","password":"wrong-password"}`); rec.Code != 401 {
-			t.Fatalf("attempt %d: %d", i, rec.Code)
-		}
-	}
-	rec := e.do("POST", "/v1/auth/login", "", `{"username":"svc","password":"`+testPassword+`"}`)
-	if rec.Code != 429 || rec.Header().Get("Retry-After") == "" {
-		t.Fatalf("correct password while blocked: %d", rec.Code)
-	}
-	// Another client is unaffected.
-	req := httptest.NewRequest("POST", "/v1/auth/login", strings.NewReader(`{"username":"svc","password":"`+testPassword+`"}`))
-	req.Header.Set("X-Real-IP", "10.0.0.2")
-	req.RemoteAddr = "127.0.0.1:50000"
-	other := httptest.NewRecorder()
-	e.h.ServeHTTP(other, req)
-	if other.Code != 200 {
-		t.Fatalf("other client: %d", other.Code)
-	}
-}
-
-func TestLoginRejectsWrongUser(t *testing.T) {
-	e := newEnv(t, newDir())
-	if rec := e.do("POST", "/v1/auth/login", "", `{"username":"root","password":"`+testPassword+`"}`); rec.Code != 401 {
-		t.Fatal(rec.Code)
-	}
-}
-
-func TestSyncDryRunIsDefaultAndWritesNothing(t *testing.T) {
+func TestSyncDryRunWritesNothing(t *testing.T) {
 	e := newEnv(t, newDir())
 	tok := e.token(t)
 	body := `{"orgs":{"Team":{"members":{"keep@x.io":"user","new@x.io":"admin","wait@x.io":"user","other@x.io":"user"}}}}`
-	rec := e.do("POST", "/v1/sync", tok, body)
+	rec := e.do("POST", "/v1/sync?dry_run=true", tok, body)
 	if rec.Code != 200 {
 		t.Fatalf("%d %s", rec.Code, rec.Body)
 	}
@@ -230,11 +183,11 @@ func TestSyncDryRunIsDefaultAndWritesNothing(t *testing.T) {
 	}
 }
 
-func TestSyncApply(t *testing.T) {
+func TestSyncExecutesByDefault(t *testing.T) {
 	e := newEnv(t, newDir())
 	tok := e.token(t)
 	body := `{"orgs":{"o1":{"members":{"keep@x.io":"admin","new@x.io":"user","wait@x.io":"user","other@x.io":"user"}}}}`
-	rec := e.do("POST", "/v1/sync?apply=true", tok, body)
+	rec := e.do("POST", "/v1/sync", tok, body)
 	if rec.Code != 200 {
 		t.Fatalf("%d %s", rec.Code, rec.Body)
 	}
@@ -261,7 +214,7 @@ func TestSyncPartialFailureIs207AndContinues(t *testing.T) {
 	dir.failMail = "bad@x.io"
 	e := newEnv(t, dir)
 	body := `{"orgs":{"Team":{"members":{"keep@x.io":"user","gone@x.io":"user","wait@x.io":"user","other@x.io":"user","bad@x.io":"user","good@x.io":"user"}}}}`
-	rec := e.do("POST", "/v1/sync?apply=true", e.token(t), body)
+	rec := e.do("POST", "/v1/sync", e.token(t), body)
 	if rec.Code != 207 || decode(t, rec)["failures"] != float64(1) {
 		t.Fatalf("%d %s", rec.Code, rec.Body)
 	}
@@ -274,11 +227,11 @@ func TestRemovalLimitBlocksBeforeAnyChange(t *testing.T) {
 	e := newEnv(t, newDir())
 	tok := e.token(t)
 	body := `{"orgs":{"Team":{"members":{"new@x.io":"user"}}}}`
-	rec := e.do("POST", "/v1/sync?apply=true&max_removals=2", tok, body)
+	rec := e.do("POST", "/v1/sync?max_removals=2", tok, body)
 	if rec.Code != 422 || len(e.dir.writes) != 0 {
 		t.Fatalf("%d writes=%v", rec.Code, e.dir.writes)
 	}
-	if rec := e.do("POST", "/v1/sync?apply=true&no_remove=true&max_removals=0", tok, body); rec.Code != 200 {
+	if rec := e.do("POST", "/v1/sync?no_remove=true&max_removals=0", tok, body); rec.Code != 200 {
 		t.Fatalf("no_remove must bypass the limit: %d %s", rec.Code, rec.Body)
 	}
 	for _, w := range e.dir.writes {
@@ -301,7 +254,7 @@ func TestSyncValidatesInput(t *testing.T) {
 		"unknown2 role":    {"/v1/sync", `{"orgs":{"Team":{"members":{"a@x.io":"unknown"}}}}`, 400},
 		"bad email":        {"/v1/sync", `{"orgs":{"Team":{"members":{"nope":"user"}}}}`, 422},
 		"unknown org":      {"/v1/sync", `{"orgs":{"Nope":{"members":{}}}}`, 404},
-		"bad apply flag":   {"/v1/sync?apply=maybe", `{}`, 400},
+		"bad dry_run flag": {"/v1/sync?dry_run=maybe", `{}`, 400},
 		"bad limit":        {"/v1/sync?max_removals=-1", `{}`, 400},
 		"trailing garbage": {"/v1/sync", `{} {}`, 400},
 	}
@@ -318,10 +271,10 @@ func TestSyncValidatesInput(t *testing.T) {
 func TestConfirmNeedsAllowlistOrAll(t *testing.T) {
 	e := newEnv(t, newDir())
 	tok := e.token(t)
-	if rec := e.do("POST", "/v1/confirm?apply=true", tok, ""); rec.Code != 400 {
+	if rec := e.do("POST", "/v1/confirm", tok, ""); rec.Code != 400 {
 		t.Fatalf("%d", rec.Code)
 	}
-	if rec := e.do("POST", "/v1/confirm?apply=true&all=true", tok, `{"emails":["wait@x.io"]}`); rec.Code != 400 {
+	if rec := e.do("POST", "/v1/confirm?all=true", tok, `{"emails":["wait@x.io"]}`); rec.Code != 400 {
 		t.Fatalf("both emails and all: %d", rec.Code)
 	}
 	if len(e.dir.writes) != 0 {
@@ -329,14 +282,14 @@ func TestConfirmNeedsAllowlistOrAll(t *testing.T) {
 	}
 }
 
-func TestConfirmOnlyAllowlistedAndDryRunDefault(t *testing.T) {
+func TestConfirmOnlyAllowlistedAndDryRunLists(t *testing.T) {
 	e := newEnv(t, newDir())
 	tok := e.token(t)
-	dry := e.do("POST", "/v1/confirm", tok, `{"emails":["WAIT@x.io"]}`)
+	dry := e.do("POST", "/v1/confirm?dry_run=true", tok, `{"emails":["WAIT@x.io"]}`)
 	if dry.Code != 200 || len(e.dir.writes) != 0 || !strings.Contains(dry.Body.String(), "wait@x.io") || strings.Contains(dry.Body.String(), "other@x.io") {
 		t.Fatalf("%d %s writes=%v", dry.Code, dry.Body, e.dir.writes)
 	}
-	rec := e.do("POST", "/v1/confirm?apply=true", tok, `{"emails":["wait@x.io"]}`)
+	rec := e.do("POST", "/v1/confirm", tok, `{"emails":["wait@x.io"]}`)
 	if rec.Code != 200 || len(e.dir.writes) != 1 || e.dir.writes[0] != "confirm wait@x.io orgkey" {
 		t.Fatalf("%d %s writes=%v", rec.Code, rec.Body, e.dir.writes)
 	}
@@ -344,7 +297,7 @@ func TestConfirmOnlyAllowlistedAndDryRunDefault(t *testing.T) {
 
 func TestConfirmAll(t *testing.T) {
 	e := newEnv(t, newDir())
-	rec := e.do("POST", "/v1/confirm?apply=true&all=true", e.token(t), "")
+	rec := e.do("POST", "/v1/confirm?all=true", e.token(t), "")
 	if rec.Code != 200 || len(e.dir.writes) != 2 {
 		t.Fatalf("%d %s %v", rec.Code, rec.Body, e.dir.writes)
 	}
@@ -355,10 +308,10 @@ func TestConfirmWithoutMasterPasswordIs503ButDryRunWorks(t *testing.T) {
 	dir.noVault = true
 	e := newEnv(t, dir)
 	tok := e.token(t)
-	if rec := e.do("POST", "/v1/confirm?all=true", tok, ""); rec.Code != 200 {
+	if rec := e.do("POST", "/v1/confirm?dry_run=true&all=true", tok, ""); rec.Code != 200 {
 		t.Fatalf("dry run needs no master password: %d %s", rec.Code, rec.Body)
 	}
-	rec := e.do("POST", "/v1/confirm?apply=true&all=true", tok, "")
+	rec := e.do("POST", "/v1/confirm?all=true", tok, "")
 	if rec.Code == 200 || len(dir.writes) != 0 {
 		t.Fatalf("%d writes=%v", rec.Code, dir.writes)
 	}
@@ -372,12 +325,12 @@ func TestSecondWriteWhileOneRunsGets409(t *testing.T) {
 	body := `{"orgs":{"Team":{"members":{"keep@x.io":"user","gone@x.io":"user","wait@x.io":"user","other@x.io":"user","new@x.io":"user"}}}}`
 
 	done := make(chan int)
-	go func() { done <- e.do("POST", "/v1/sync?apply=true", tok, body).Code }()
+	go func() { done <- e.do("POST", "/v1/sync", tok, body).Code }()
 	<-dir.started
-	if rec := e.do("POST", "/v1/sync?apply=true", tok, body); rec.Code != 409 {
+	if rec := e.do("POST", "/v1/sync", tok, body); rec.Code != 409 {
 		t.Fatalf("second writer: %d", rec.Code)
 	}
-	if rec := e.do("POST", "/v1/sync", tok, body); rec.Code != 200 {
+	if rec := e.do("POST", "/v1/sync?dry_run=true", tok, body); rec.Code != 200 {
 		t.Fatalf("a dry run must not be blocked: %d", rec.Code)
 	}
 	close(dir.block)
@@ -404,13 +357,52 @@ func TestExportAndMembers(t *testing.T) {
 	if exp.Code != 200 {
 		t.Fatal(exp.Code)
 	}
-	// The "desired" part must be accepted as-is by /v1/sync and plan nothing.
+	// Der Teil "desired" muss von /v1/sync unverändert akzeptiert werden und nichts planen.
 	var parsed struct {
 		Desired json.RawMessage `json:"desired"`
 	}
 	_ = json.Unmarshal(exp.Body.Bytes(), &parsed)
-	round := e.do("POST", "/v1/sync", tok, string(parsed.Desired))
+	round := e.do("POST", "/v1/sync?dry_run=true", tok, string(parsed.Desired))
 	if round.Code != 200 || bytes.Contains(round.Body.Bytes(), []byte(`"type"`)) {
 		t.Fatalf("export is not a no-op when synced back: %d %s", round.Code, round.Body)
+	}
+}
+
+func TestTheOldApplyParameterIsRejectedInsteadOfBeingIgnored(t *testing.T) {
+	// Wer apply=false sendet, erwartet eine Vorschau. Würde der Parameter ignoriert, liefe der Aufruf
+	// stattdessen, deshalb muss er deutlich scheitern.
+	e := newEnv(t, newDir())
+	tok := e.token(t)
+	body := `{"orgs":{"Team":{"members":{"new@x.io":"user"}}}}`
+	for _, c := range []struct{ path, body string }{
+		{"/v1/sync?apply=false", body},
+		{"/v1/sync?apply=true", body},
+		{"/v1/confirm?apply=false&all=true", ""},
+		{"/v1/orgs?apply=false", `{"name":"Fresh"}`},
+	} {
+		rec := e.do("POST", c.path, tok, c.body)
+		if rec.Code != 400 || !strings.Contains(rec.Body.String(), "dry_run=true") {
+			t.Errorf("%s: %d %s", c.path, rec.Code, rec.Body)
+		}
+	}
+	if len(e.dir.writes) != 0 {
+		t.Fatalf("a rejected call must not write: %v", e.dir.writes)
+	}
+}
+
+func TestEveryWriteEndpointExecutesWithoutAnyParameter(t *testing.T) {
+	e := newEnv(t, waitingDir())
+	tok := e.token(t)
+	if rec := e.do("POST", "/v1/sync?no_remove=true", tok, `{"orgs":{"Team":{"members":{"new@x.io":"user"}}}}`); rec.Code != 200 {
+		t.Fatalf("sync: %d %s", rec.Code, rec.Body)
+	}
+	if rec := e.do("POST", "/v1/confirm", tok, `{"emails":["ready@x.io"]}`); rec.Code != 200 {
+		t.Fatalf("confirm: %d %s", rec.Code, rec.Body)
+	}
+	if rec := e.do("POST", "/v1/orgs", tok, `{"name":"Fresh"}`); rec.Code != 201 {
+		t.Fatalf("%d %s", rec.Code, rec.Body)
+	}
+	if len(e.dir.writes) != 3 {
+		t.Fatalf("expected an invite, a confirm and a created org, got %v", e.dir.writes)
 	}
 }

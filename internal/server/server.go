@@ -1,5 +1,5 @@
-// Package server is the HTTP layer: routing, authentication, request validation, error mapping.
-// All business logic lives in package reconcile.
+// Package server ist die HTTP-Schicht mit Routing, Authentifizierung, Prüfung der Requests und
+// Abbildung von Fehlern auf Statuscodes. Die Fachlogik liegt im Paket reconcile.
 package server
 
 import (
@@ -14,6 +14,7 @@ import (
 	"net"
 	"net/http"
 	"net/mail"
+	"net/url"
 	"runtime/debug"
 	"strconv"
 	"strings"
@@ -28,23 +29,22 @@ import (
 )
 
 const (
-	maxBodyBytes        = 1 << 20
-	defaultMaxRemovals  = 5
-	writeTimeout        = 10 * time.Minute
-	loginFailuresPerMin = 5
-	maxOrgNameLen       = 50
+	maxBodyBytes       = 1 << 20
+	defaultMaxRemovals = 5
+	writeTimeout       = 10 * time.Minute
+	maxOrgNameLen      = 50
 )
 
-// Directory is everything the handlers need from Vaultwarden: the reconcile operations plus the
-// key vault for confirm. *vaultwarden.Client implements it.
+// Directory ist alles, was die Handler von Vaultwarden brauchen, also die Operationen für den Abgleich
+// und den Schlüsseltresor für confirm. *vaultwarden.Client implementiert es.
 type Directory interface {
 	reconcile.Directory
 	Vault(ctx context.Context) (reconcile.OrgKeys, error)
 }
 
-// Deps are the collaborators of the server.
+// Deps sind die Abhängigkeiten des Servers.
 type Deps struct {
-	Auth       *auth.Authenticator
+	Auth       *auth.Keys
 	Dir        Directory
 	Log        *slog.Logger
 	TrustProxy bool
@@ -52,20 +52,18 @@ type Deps struct {
 
 type server struct {
 	Deps
-	svc     *reconcile.Service
-	limiter *auth.Limiter
-	// writeMu serializes sync and confirm. Two concurrent writers would plan against the same
-	// state and invite or remove twice. Requests do not queue: a second one gets 409.
+	svc *reconcile.Service
+	// writeMu serialisiert die schreibenden Aufrufe. Zwei gleichzeitige Schreiber würden gegen denselben
+	// Zustand planen und doppelt einladen oder entfernen. Requests warten nicht, ein zweiter erhält 409.
 	writeMu sync.Mutex
 }
 
-// New builds the HTTP handler.
+// New baut den HTTP-Handler.
 func New(d Deps) http.Handler {
-	s := &server{Deps: d, svc: reconcile.NewService(d.Dir), limiter: auth.NewLimiter(loginFailuresPerMin, time.Minute)}
+	s := &server{Deps: d, svc: reconcile.NewService(d.Dir)}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) { writeJSON(w, 200, map[string]string{"status": "ok"}) })
-	mux.HandleFunc("POST /v1/auth/login", s.login)
 	mux.Handle("GET /v1/orgs", s.authed(s.listOrgs))
 	mux.Handle("POST /v1/orgs", s.authed(s.createOrg))
 	mux.Handle("GET /v1/orgs/{org}/members", s.authed(s.orgMembers))
@@ -78,84 +76,42 @@ func New(d Deps) http.Handler {
 
 // --- auth ---------------------------------------------------------------------------------------
 
-func (s *server) login(w http.ResponseWriter, r *http.Request) {
-	ip := s.clientIP(r)
-	if blocked, wait := s.limiter.Blocked(ip); blocked {
-		w.Header().Set("Retry-After", strconv.Itoa(int(wait.Seconds())+1))
-		writeError(w, http.StatusTooManyRequests, "too many failed logins, try again later")
-		return
-	}
-	var req struct {
-		Username string `json:"username"`
-		Password string `json:"password"`
-	}
-	if !decodeJSON(w, r, &req) {
-		return
-	}
-	token, expires, ok := s.Auth.Login(req.Username, req.Password)
-	if !ok {
-		s.limiter.Fail(ip)
-		s.Log.Warn("login failed", "ip", ip)
-		writeError(w, http.StatusUnauthorized, "invalid credentials")
-		return
-	}
-	s.limiter.Reset(ip)
-	writeJSON(w, 200, map[string]any{
-		"access_token": token,
-		"token_type":   "Bearer",
-		"expires_in":   int(time.Until(expires).Seconds()),
-	})
-}
-
+// authed lässt einen Request nur durch, wenn er einen gültigen Zugangsschlüssel als
+// "Authorization: Bearer <Schlüssel>" trägt. Ein abgewiesener Request wird mit der Adresse des
+// Aufrufers protokolliert, aber nie mit dem vorgelegten Schlüssel.
 func (s *server) authed(next http.HandlerFunc) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		token, ok := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
-		if !ok || s.Auth.Verify(token) != nil {
+		scheme, key, found := strings.Cut(r.Header.Get("Authorization"), " ")
+		if !found || !strings.EqualFold(scheme, "Bearer") || !s.Auth.Verify(strings.TrimSpace(key)) {
+			s.Log.Warn("request rejected", "reason", "missing or invalid API key", "ip", s.clientIP(r), "method", r.Method, "path", r.URL.Path)
 			w.Header().Set("WWW-Authenticate", `Bearer realm="vwsync-api"`)
-			writeError(w, http.StatusUnauthorized, "missing or invalid token")
+			writeError(w, http.StatusUnauthorized, "missing or invalid API key")
 			return
 		}
 		next(w, r)
 	})
 }
 
-// clientIP is the key used for rate limiting. Behind nginx every request comes from the proxy, so with
-// TrustProxy the real address is read from X-Real-IP. The header is believed only when the request
-// itself comes from the loopback interface, where nginx runs. Otherwise anyone who can reach the
-// port could invent an address and dodge the limit.
-//
-// IPv6 clients are grouped by their /64 prefix: one subscriber usually owns a whole /64, and
-// rotating inside it would otherwise give an attacker unlimited fresh addresses.
+// clientIP ist die Adresse des Aufrufers für das Log. Hinter nginx kommt jeder Request vom Proxy, mit
+// TrustProxy wird die echte Adresse deshalb aus X-Real-IP gelesen. Der Header gilt nur, wenn der
+// Request selbst von der Loopback-Schnittstelle kommt, wo nginx läuft. Sonst könnte jeder, der den
+// Port erreicht, eine beliebige Adresse ins Log schreiben.
 func (s *server) clientIP(r *http.Request) string {
 	remote := r.RemoteAddr
 	if host, _, err := net.SplitHostPort(remote); err == nil {
 		remote = host
 	}
-	addr := remote
 	if s.TrustProxy && isLoopback(remote) {
 		if ip := strings.TrimSpace(r.Header.Get("X-Real-IP")); ip != "" {
-			addr = ip
+			return ip
 		}
 	}
-	return limiterKey(addr)
+	return remote
 }
 
 func isLoopback(host string) bool {
 	ip := net.ParseIP(host)
 	return ip != nil && ip.IsLoopback()
-}
-
-// limiterKey normalizes an address: IPv4 as is, IPv6 reduced to its /64 prefix. Anything that is not
-// an IP address is used unchanged.
-func limiterKey(addr string) string {
-	ip := net.ParseIP(addr)
-	if ip == nil {
-		return addr
-	}
-	if v4 := ip.To4(); v4 != nil {
-		return v4.String()
-	}
-	return ip.Mask(net.CIDRMask(64, 128)).String() + "/64"
 }
 
 // --- read endpoints -----------------------------------------------------------------------------
@@ -169,9 +125,9 @@ func (s *server) listOrgs(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{"orgs": orgs})
 }
 
-// createOrg creates an organization owned by the API account. Dry run is the default.
+// createOrg legt eine Organisation an, deren Owner das API-Konto wird. dry_run=true prüft nur den Namen.
 func (s *server) createOrg(w http.ResponseWriter, r *http.Request) {
-	apply, ok := queryBool(w, r.URL.Query().Get("apply"), "apply")
+	apply, ok := writeMode(w, r.URL.Query())
 	if !ok {
 		return
 	}
@@ -201,7 +157,8 @@ func (s *server) createOrg(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		defer s.writeMu.Unlock()
-		// Creating must not be cut off half way: the server would keep an org the caller never heard of.
+		// Das Anlegen darf nicht mittendrin abbrechen, sonst bliebe eine Org zurück, von der der Aufrufer
+		// nichts weiß.
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(context.WithoutCancel(ctx), writeTimeout)
 		defer cancel()
@@ -243,8 +200,8 @@ func (s *server) orgMembers(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, orgMembers{o, members})
 }
 
-// export returns the actual state of every admin org. "desired" has the shape of a sync request
-// body (revoked members left out), so the response can be edited and sent back to /v1/sync.
+// export liefert den Ist-Zustand jeder verwalteten Org. "desired" hat die Form eines Sync-Bodys (ohne
+// gesperrte Mitglieder), die Antwort lässt sich also bearbeiten und an /v1/sync zurückschicken.
 func (s *server) export(w http.ResponseWriter, r *http.Request) {
 	orgs, err := s.Dir.AdminOrganizations(r.Context())
 	if err != nil {
@@ -265,7 +222,7 @@ func (s *server) export(w http.ResponseWriter, r *http.Request) {
 		out = append(out, orgMembers{o, members})
 		d := desiredOrg{Members: map[string]model.Role{}}
 		for _, m := range members {
-			// Revoked members stay out, otherwise a sync would "expect" them.
+			// Gesperrte Mitglieder bleiben draußen, sonst würde ein Sync sie "erwarten".
 			if m.Status != model.Revoked {
 				d.Members[m.Email] = m.Role
 			}
@@ -282,13 +239,19 @@ type orgSync struct {
 	Results []reconcile.ChangeResult `json:"results,omitempty"`
 }
 
-// sync plans, and with apply=true executes, the desired state. Dry run is the default.
+// sync plant den Soll-Zustand und führt den Plan aus. Mit dry_run=true liefert er nur den Plan.
 func (s *server) sync(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
-	apply, ok1 := queryBool(w, q.Get("apply"), "apply")
-	noRemove, ok2 := queryBool(w, q.Get("no_remove"), "no_remove")
-	limit, ok3 := queryInt(w, q.Get("max_removals"), "max_removals", defaultMaxRemovals)
-	if !ok1 || !ok2 || !ok3 {
+	apply, ok := writeMode(w, q)
+	if !ok {
+		return
+	}
+	noRemove, ok := queryBool(w, q.Get("no_remove"), "no_remove")
+	if !ok {
+		return
+	}
+	limit, ok := queryInt(w, q.Get("max_removals"), "max_removals", defaultMaxRemovals)
+	if !ok {
 		return
 	}
 	var input reconcile.DesiredInput
@@ -308,7 +271,7 @@ func (s *server) sync(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		defer s.writeMu.Unlock()
-		// A caller that hangs up must not leave a half-applied run behind.
+		// Ein Aufrufer, der die Verbindung trennt, darf keinen halb ausgeführten Lauf hinterlassen.
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(context.WithoutCancel(ctx), writeTimeout)
 		defer cancel()
@@ -320,8 +283,8 @@ func (s *server) sync(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Removal limit across ALL orgs, checked before anything changes. It protects against an
-	// accidentally empty or wrong request that would remove every member.
+	// Obergrenze für Entfernungen über ALLE Orgs, geprüft vor jeder Änderung. Sie schützt vor einem
+	// versehentlich leeren oder falschen Request, der alle Mitglieder entfernen würde.
 	removals := 0
 	for _, p := range plans {
 		removals += p.Removals()
@@ -355,15 +318,19 @@ func (s *server) sync(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, status, map[string]any{"dry_run": !apply, "failures": failures, "plans": out})
 }
 
-// confirm confirms members whose status is "accepted". Dry run is the default.
+// confirm bestätigt Mitglieder mit Status "accepted". Mit dry_run=true listet er sie nur auf.
 //
-// Confirming trusts the public key the server hands out for the member, so the caller must either
-// name the e-mail addresses to confirm or pass all=true explicitly.
+// Beim Bestätigen wird dem öffentlichen Schlüssel vertraut, den der Server für das Mitglied liefert.
+// Deshalb muss der Aufrufer entweder die zu bestätigenden Adressen nennen oder ausdrücklich all=true
+// setzen.
 func (s *server) confirm(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
-	apply, ok1 := queryBool(w, q.Get("apply"), "apply")
-	all, ok2 := queryBool(w, q.Get("all"), "all")
-	if !ok1 || !ok2 {
+	apply, ok := writeMode(w, q)
+	if !ok {
+		return
+	}
+	all, ok := queryBool(w, q.Get("all"), "all")
+	if !ok {
 		return
 	}
 	var body struct {
@@ -422,7 +389,8 @@ func (s *server) confirm(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, status, map[string]any{"dry_run": !apply, "failures": failures, "orgs": orgs})
 }
 
-// auditSync writes one log line per executed change, so the log says who was invited, changed or removed.
+// auditSync schreibt je ausgeführter Änderung eine Logzeile, damit das Log zeigt, wer eingeladen,
+// geändert oder entfernt wurde.
 func (s *server) auditSync(org string, results []reconcile.ChangeResult) {
 	for _, r := range results {
 		attrs := []any{"org", org, "type", string(r.Type), "email", r.Email, "ok", r.OK}
@@ -451,9 +419,27 @@ func (s *server) auditConfirm(org string, results []reconcile.ConfirmResult) {
 	}
 }
 
+// loggedParams sind die Query-Parameter, die der Dienst kennt. Es sind Schalter und Zahlen, nichts
+// Geheimes.
+var loggedParams = []string{"dry_run", "no_remove", "max_removals", "all"}
+
+// loggableQuery liefert die bekannten Parameter für das Access-Log. Alles andere bleibt draußen, weil
+// ein Aufrufer, der den Zugangsschlüssel fälschlich als ?key=... sendet, ihn sonst ins Log schreiben
+// würde.
+func loggableQuery(q url.Values) string {
+	out := url.Values{}
+	for _, name := range loggedParams {
+		if v, ok := q[name]; ok {
+			out[name] = v
+		}
+	}
+	return out.Encode()
+}
+
 // --- helpers ------------------------------------------------------------------------------------
 
-// fail maps an internal error to an HTTP status. Messages never contain secrets or request bodies.
+// fail bildet einen internen Fehler auf einen HTTP-Status ab. Meldungen enthalten nie Secrets oder
+// Request-Bodies.
 func (s *server) fail(w http.ResponseWriter, err error) {
 	var notFound *reconcile.OrgNotFoundError
 	var exists *reconcile.OrgExistsError
@@ -481,15 +467,15 @@ func decodeJSON(w http.ResponseWriter, r *http.Request, v any) bool {
 	return readJSON(w, r, v, false)
 }
 
-// decodeOptionalJSON is decodeJSON for endpoints where the body may be left out entirely. An empty
-// body counts as absent whether it comes with Content-Length: 0 or as an empty chunked stream.
+// decodeOptionalJSON ist decodeJSON für Endpunkte, bei denen der Body ganz fehlen darf. Ein leerer
+// Body gilt als nicht vorhanden, egal ob er mit Content-Length: 0 oder als leerer Chunked-Stream kommt.
 func decodeOptionalJSON(w http.ResponseWriter, r *http.Request, v any) bool {
 	return readJSON(w, r, v, true)
 }
 
 func readJSON(w http.ResponseWriter, r *http.Request, v any, optional bool) bool {
 	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxBodyBytes))
-	dec.DisallowUnknownFields() // a typo like "membres" must not silently mean "remove everyone"
+	dec.DisallowUnknownFields() // ein Tippfehler wie "membres" darf nicht still "alle entfernen" bedeuten
 	if err := dec.Decode(v); err != nil {
 		if optional && errors.Is(err, io.EOF) {
 			return true
@@ -502,6 +488,20 @@ func readJSON(w http.ResponseWriter, r *http.Request, v any, optional bool) bool
 		return false
 	}
 	return true
+}
+
+// writeMode liest, wie ein schreibender Endpunkt läuft. Standard ist Ausführen, dry_run=true liefert
+// nur eine Vorschau.
+//
+// Der Parameter apply wird bewusst abgelehnt statt ignoriert. Ein Aufrufer, der apply=false sendet und
+// eine Vorschau erwartet, würde sonst still ausführen.
+func writeMode(w http.ResponseWriter, q url.Values) (apply, ok bool) {
+	if _, legacy := q["apply"]; legacy {
+		writeError(w, http.StatusBadRequest, "the apply parameter does not exist: writes run directly, pass dry_run=true to preview")
+		return false, false
+	}
+	dryRun, ok := queryBool(w, q.Get("dry_run"), "dry_run")
+	return !dryRun, ok
 }
 
 func queryBool(w http.ResponseWriter, raw, name string) (bool, bool) {
@@ -549,14 +549,14 @@ func (w *statusWriter) WriteHeader(code int) {
 	w.ResponseWriter.WriteHeader(code)
 }
 
-// logging records method, path, query, status and duration. Never headers or bodies: they hold tokens and passwords.
+// logging protokolliert Methode, Pfad, bekannte Query-Parameter, Status und Dauer. Nie Header oder
+// Bodies, denn die enthalten Schlüssel und Passwörter.
 func (s *server) logging(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
 		sw := &statusWriter{ResponseWriter: w, status: http.StatusOK}
 		next.ServeHTTP(sw, r)
-		// The query only holds flags such as apply=true. It is what tells a dry run from a write.
-		s.Log.Info("request", "method", r.Method, "path", r.URL.Path, "query", r.URL.RawQuery, "status", sw.status, "ms", time.Since(start).Milliseconds())
+		s.Log.Info("request", "method", r.Method, "path", r.URL.Path, "query", loggableQuery(r.URL.Query()), "status", sw.status, "ms", time.Since(start).Milliseconds())
 	})
 }
 

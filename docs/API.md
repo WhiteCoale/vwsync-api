@@ -1,53 +1,91 @@
 # API-Referenz
 
-Basis-URL: `https://vwsync.example.com`. Alle Endpunkte unter `/v1` sprechen JSON, Requests mit Body brauchen keinen besonderen `Content-Type`-Header, der Body wird immer als JSON gelesen.
-
-Die Beispiele nutzen diese Variablen:
-
-```bash
-BASE=https://vwsync.example.com
-TOKEN=...   # siehe "Login" unten
-```
+Diese Referenz beschreibt alle Endpunkte von vwsync-api. Eine Einführung steht in der [README](../README.md), die Installation in [SETUP.md](../SETUP.md).
 
 ## Inhalt
 
-- [Grundlagen](#grundlagen)
-- [Login](#post-v1authlogin)
-- [Organisationen](#organisationen): [auflisten](#get-v1orgs), [anlegen](#post-v1orgs)
-- [Mitglieder](#mitglieder): [je Org](#get-v1orgsorgmembers), [Export](#get-v1export)
-- [Sync](#post-v1sync)
-- [Confirm](#post-v1confirm)
+- [Konventionen](#konventionen)
+- [Endpunkte im Überblick](#endpunkte-im-überblick)
+- [Authentifizierung](#authentifizierung)
+- [Organisationen](#organisationen): [`GET /v1/orgs`](#get-v1orgs), [`POST /v1/orgs`](#post-v1orgs)
+- [Mitglieder](#mitglieder): [`GET /v1/orgs/{org}/members`](#get-v1orgsorgmembers), [`GET /v1/export`](#get-v1export)
+- [Abgleich](#post-v1sync): [`POST /v1/sync`](#post-v1sync)
+- [Bestätigung](#post-v1confirm): [`POST /v1/confirm`](#post-v1confirm)
+- [Datentypen](#datentypen)
 - [Rollen und Status](#rollen-und-status)
 - [Typische Abläufe](#typische-abläufe)
 - [Statuscodes](#statuscodes)
 
-## Grundlagen
+## Konventionen
 
-**Authentifizierung.** Außer `GET /healthz` und `POST /v1/auth/login` verlangt jeder Endpunkt den Header `Authorization: Bearer <token>`. Das Token kommt vom Login und gilt standardmäßig 15 Minuten (`VWSYNC_TOKEN_TTL`).
+Die Beispiele verwenden diese Variablen.
 
-**Logs.** Jeder Request erscheint im Log mit Methode, Pfad, Query und Status. Jede ausgeführte Änderung steht zusätzlich als eigene Zeile `audit` im Log, mit Org, Art, E-Mail und Ergebnis. Ein Dry-Run erzeugt keine `audit`-Zeilen.
+```bash
+BASE=https://vwsync.example.com
+KEY=vwsk_...    # Zugangsschlüssel, siehe Authentifizierung
+```
 
-**Fehlerformat.** Jeder Fehler hat denselben Aufbau und enthält nie Passwörter, Tokens oder Request-Bodies:
+**Format.** Alle Endpunkte unter `/v1` erwarten und liefern JSON. Der Body wird immer als JSON gelesen, ein `Content-Type`-Header ist nicht nötig. Unbekannte Felder im Body führen zu `400`.
+
+**Authentifizierung.** Mit Ausnahme von `GET /healthz` verlangt jeder Endpunkt den Header `Authorization: Bearer <Zugangsschlüssel>`, siehe [Authentifizierung](#authentifizierung).
+
+**Fehlerformat.** Jeder Fehler hat denselben Aufbau. Antworten enthalten weder Schlüssel noch Passwörter noch Request-Bodies.
 
 ```json
 { "error": "organization \"Nope\" not found, or the API account is neither owner nor admin there" }
 ```
 
-**Dry-Run ist Standard.** Alle schreibenden Endpunkte (`POST /v1/orgs`, `/v1/sync`, `/v1/confirm`) ändern erst etwas, wenn die Query `apply=true` gesetzt ist. Ohne sie zeigt die Antwort, was passieren würde.
+**Ausführen und Vorschau.** Die schreibenden Endpunkte `POST /v1/orgs`, `POST /v1/sync` und `POST /v1/confirm` führen aus, was sie erhalten. Mit der Query `dry_run=true` ändern sie nichts und liefern eine Vorschau im selben Aufbau wie die Antwort eines echten Laufs. Das Feld `dry_run` in der Antwort benennt den Modus. Eine Vorschau vor dem ersten Aufruf mit einer neuen Soll-Datei ist empfehlenswert, denn ein echter Aufruf lässt sich nicht zurücknehmen.
 
-**Org ansprechen.** Eine Organisation lässt sich über Name oder ID ansprechen. Die ID muss exakt stimmen, beim Namen zählt die Groß- und Kleinschreibung nicht: `team alpha` findet "Team Alpha". Gibt es zwei Orgs, deren Namen sich nur darin unterscheiden, gewinnt die exakte Schreibweise. Passt keine exakt, antwortet der Service mit `422` und nennt die IDs. Namen mit Leerzeichen müssen in Pfaden URL-kodiert werden (`Team%20Alpha`).
+Der Parameter `apply` wird nicht unterstützt. Wer ihn sendet, erhält `400`, damit `apply=false` nicht versehentlich als Ausführung endet.
 
-**E-Mail-Adressen** sind in Antworten immer klein geschrieben, Eingaben werden klein geschrieben und getrimmt.
+**Organisationen ansprechen.** Eine Organisation lässt sich über ihre ID oder ihren Namen ansprechen. Die ID muss exakt stimmen. Beim Namen spielt die Groß- und Kleinschreibung keine Rolle, `team alpha` findet also "Team Alpha". Unterscheiden sich zwei Organisationen nur in der Schreibweise ihres Namens, gewinnt eine exakt passende Schreibweise. Passt keine exakt, antwortet der Dienst mit `422` und nennt die IDs. In Pfaden müssen Leerzeichen kodiert werden, etwa `Team%20Alpha`.
 
-**Ein Schreiblauf zugleich.** `apply=true` bei `/v1/orgs`, `/v1/sync` und `/v1/confirm` nimmt eine gemeinsame Sperre. Läuft schon ein Schreibzugriff, antwortet der zweite sofort mit `409`, er wartet nicht. Dry-Runs und Lese-Endpunkte sind nie gesperrt.
+**E-Mail-Adressen.** Eingaben werden getrimmt und in Kleinbuchstaben umgewandelt. Antworten enthalten Adressen immer in Kleinbuchstaben.
 
-**Abbruch des Clients.** Trennt der Aufrufer bei einem `apply=true`-Request die Verbindung, läuft der Lauf trotzdem zu Ende (bis zu 10 Minuten).
+**Ein Schreiblauf zugleich.** Die ausführenden Aufrufe von `/v1/orgs`, `/v1/sync` und `/v1/confirm` teilen sich eine Sperre. Läuft bereits einer, antwortet der Dienst sofort mit `409` und wartet nicht. Vorschauen und lesende Endpunkte sind nie gesperrt.
+
+**Abbruch durch den Aufrufer.** Trennt der Aufrufer während eines ausführenden Aufrufs die Verbindung, läuft der Lauf zu Ende. Er ist auf höchstens zehn Minuten begrenzt.
+
+**Wiederholbarkeit.** Der Abgleich ist idempotent. Nach einem erfolgreichen Lauf liefert derselbe Aufruf einen leeren Plan. Ein Lauf, der teilweise fehlgeschlagen ist, lässt sich ohne Nebenwirkungen wiederholen und holt nur den Rest nach.
+
+## Endpunkte im Überblick
+
+| Methode | Pfad | Authentifizierung | Zweck |
+|---|---|---|---|
+| `GET` | `/healthz` | nein | Lebenszeichen des Prozesses |
+| `GET` | `/v1/orgs` | ja | Verwaltbare Organisationen auflisten |
+| `POST` | `/v1/orgs` | ja | Organisation anlegen |
+| `GET` | `/v1/orgs/{org}/members` | ja | Mitglieder einer Organisation |
+| `GET` | `/v1/export` | ja | Ist-Zustand aller Organisationen |
+| `POST` | `/v1/sync` | ja | Soll-Zustand herstellen |
+| `POST` | `/v1/confirm` | ja | Wartende Mitglieder bestätigen |
 
 ---
 
-## `GET /healthz`
+## Authentifizierung
 
-Lebenszeichen ohne Login. Prüft nur, ob der Prozess antwortet, nicht die Verbindung zu Vaultwarden.
+Der Dienst kennt keine Benutzer und keinen Login. Ein Aufrufer besitzt einen festen Zugangsschlüssel und sendet ihn mit jedem Request.
+
+```bash
+curl -H "Authorization: Bearer $KEY" $BASE/v1/orgs
+```
+
+**Der Schlüssel.** Er beginnt mit `vwsk_` und enthält 256 Bit Zufall. Der Betreiber erzeugt ihn mit `vwsync-api generate-key`. Der Befehl gibt den Schlüssel und die Konfigurationszeile `VWSYNC_API_KEY_HASH=...` aus. Der Dienst speichert nur den SHA-256-Hash des Schlüssels und vergleicht in konstanter Zeit. Den Schlüssel selbst kennt nur der Aufrufer. Er lässt sich nicht erneut anzeigen.
+
+**Gültigkeit.** Der Schlüssel läuft nicht ab. Er gilt, solange sein Hash in `VWSYNC_API_KEY_HASH` steht. Die Variable darf mehrere Hashes durch Kommas getrennt enthalten. So bleibt beim Austausch eines Schlüssels der alte gültig, bis der Aufrufer auf den neuen umgestellt ist.
+
+**Regeln für den Aufrufer.**
+
+- Das Schema ist `Bearer`, ohne Beachtung der Groß- und Kleinschreibung. Andere Schemata wie `Basic` werden abgewiesen.
+- Der Schlüssel gehört nur in den Header, nie in die URL. Parameter wie `?key=` ignoriert der Dienst, ein solcher Aufruf bleibt ohne Schlüssel und scheitert.
+- Der Schlüssel gehört in eine Datei mit Rechten `0600` oder in einen Secret-Store, nicht in ein Repository, eine Crontab oder ein Log.
+
+**Abgewiesene Aufrufe.** Fehlt der Schlüssel oder ist er falsch, antwortet der Dienst mit `401` und dem Header `WWW-Authenticate: Bearer`. Die Antwort unterscheidet nicht, ob der Schlüssel fehlte oder falsch war. Im Log des Dienstes steht die Zeile `request rejected` mit der Adresse des Aufrufers, aber nie der Schlüssel. Die Anfragen je Adresse begrenzt nginx.
+
+### `GET /healthz`
+
+Meldet, dass der Prozess antwortet. Der Endpunkt prüft nicht die Verbindung zu Vaultwarden und braucht keinen Schlüssel.
 
 ```bash
 curl $BASE/healthz
@@ -59,105 +97,75 @@ curl $BASE/healthz
 
 ---
 
-## `POST /v1/auth/login`
-
-Tauscht Benutzername und Passwort gegen ein Token.
-
-**Body**
-
-| Feld | Typ | Pflicht |
-|---|---|---|
-| `username` | string | ja |
-| `password` | string | ja |
-
-```bash
-TOKEN=$(curl -s -X POST $BASE/v1/auth/login \
-  -d '{"username":"sync","password":"..."}' | jq -r .access_token)
-```
-
-**Antwort `200`**
-
-```json
-{ "access_token": "eyJhbGciOi...", "token_type": "Bearer", "expires_in": 899 }
-```
-
-`expires_in` sind Sekunden bis zum Ablauf. Danach antwortet jeder Endpunkt mit `401`, und der Aufrufer meldet sich neu an.
-
-**Fehler**
-
-| Code | Wann |
-|---|---|
-| `401` | Benutzername oder Passwort falsch. Die Meldung unterscheidet die beiden nicht |
-| `429` | 5 fehlgeschlagene Logins innerhalb einer Minute von derselben Adresse. Der Header `Retry-After` nennt die Wartezeit in Sekunden. Auch das richtige Passwort wird in dieser Zeit abgewiesen |
-
----
-
 ## Organisationen
 
 ### `GET /v1/orgs`
 
-Alle Organisationen, die das API-Konto verwalten darf: bestätigter Owner oder Admin, Org aktiv.
+Listet die Organisationen, die das API-Konto verwalten darf. Das sind Organisationen, in denen es bestätigter Owner oder Admin ist und die aktiv sind.
 
 ```bash
-curl -H "Authorization: Bearer $TOKEN" $BASE/v1/orgs
+curl -H "Authorization: Bearer $KEY" $BASE/v1/orgs
 ```
 
 ```json
-{ "orgs": [ { "id": "a73f7d38-1214-471f-8c8c-078db8723e2c", "name": "Team Alpha" } ] }
+{
+  "orgs": [
+    { "id": "a73f7d38-1214-471f-8c8c-078db8723e2c", "name": "Team Alpha" }
+  ]
+}
 ```
 
-Ohne verwaltbare Orgs ist `orgs` eine leere Liste `[]`.
+Verwaltet das Konto keine Organisation, ist `orgs` die leere Liste `[]`.
 
 ### `POST /v1/orgs`
 
-Legt eine Organisation an. Das API-Konto wird Owner und kann die Org danach sofort mit `/v1/sync` und `/v1/confirm` nutzen. Braucht `VW_MASTER_PASSWORD`, weil der Service den Organisations-Key und das Schlüsselpaar selbst erzeugt und verschlüsselt an Vaultwarden schickt.
+Legt eine Organisation an. Das API-Konto wird ihr Owner. Der Dienst erzeugt Organisations-Schlüssel und Schlüsselpaar selbst und überträgt sie verschlüsselt. Dafür braucht er das Master-Passwort des API-Kontos. Die neue Organisation ist sofort für `/v1/sync` und `/v1/confirm` nutzbar.
 
 **Query**
 
-| Parameter | Standard | Bedeutung |
+| Parameter | Standard | Beschreibung |
 |---|---|---|
-| `apply` | `false` | `true` legt die Org wirklich an |
+| `dry_run` | `false` | `true` legt nichts an und prüft nur den Namen |
 
 **Body**
 
-| Feld | Typ | Pflicht | Bedeutung |
+| Feld | Typ | Pflicht | Beschreibung |
 |---|---|---|---|
-| `name` | string | ja | 1 bis 50 Zeichen, nach dem Trimmen |
-| `billing_email` | string | nein | Standard: die Adresse des API-Kontos |
-
-Unbekannte Felder werden mit `400` abgelehnt.
+| `name` | string | ja | 1 bis 50 Zeichen nach dem Trimmen |
+| `billing_email` | string | nein | Rechnungsadresse. Standard ist die Adresse des API-Kontos |
 
 ```bash
-curl -X POST "$BASE/v1/orgs?apply=true" -H "Authorization: Bearer $TOKEN" \
+curl -X POST "$BASE/v1/orgs" -H "Authorization: Bearer $KEY" \
   -d '{"name":"Team Alpha"}'
 ```
 
-**Antwort Dry-Run `200`**
+**Antwort `200` (`dry_run=true`)**
 
 ```json
 { "dry_run": true, "org": { "name": "Team Alpha" } }
 ```
 
-**Antwort `201`**
+**Antwort `201` (angelegt)**
 
 ```json
 { "dry_run": false, "org": { "id": "a73f7d38-1214-471f-8c8c-078db8723e2c", "name": "Team Alpha" } }
 ```
 
-**Verhalten**
+**Hinweise**
 
-- Namen sind bei Vaultwarden nicht eindeutig. Der Service prüft deshalb vorher ohne Beachtung der Groß- und Kleinschreibung, ob das API-Konto schon eine gleichnamige Org verwaltet, und antwortet mit `409`. Das gilt auch im Dry-Run. Die Prüfung sieht nur Orgs, die das API-Konto verwaltet.
-- Die erste Collection heißt "Default collection".
-- Es gibt keinen Endpunkt zum Löschen von Organisationen.
+- Vaultwarden erzwingt keine eindeutigen Organisationsnamen. Der Dienst prüft deshalb vor dem Anlegen, ob das API-Konto bereits eine Organisation mit diesem Namen verwaltet. Dabei zählt die Groß- und Kleinschreibung nicht. Die Prüfung läuft auch bei `dry_run=true`. Sie sieht nur Organisationen, die das Konto verwaltet.
+- Die erste Sammlung der Organisation heißt "Default collection".
+- Der Dienst bietet keinen Endpunkt zum Löschen von Organisationen.
 
 **Fehler**
 
-| Code | Wann |
+| Code | Ursache |
 |---|---|
-| `409` | Org mit diesem Namen existiert schon, oder ein anderer Schreiblauf läuft |
+| `400` | Ungültiges JSON oder unbekanntes Feld |
+| `409` | Eine Organisation mit diesem Namen existiert bereits, oder ein anderer Schreiblauf läuft |
 | `422` | Name leer oder länger als 50 Zeichen, oder `billing_email` ungültig |
-| `502` | Vaultwarden lehnt ab, zum Beispiel wegen `ORG_CREATION_USERS` oder einer Single-Org-Policy. Die Meldung von Vaultwarden steht in `error` |
-| `503` | `apply=true`, aber `VW_MASTER_PASSWORD` ist nicht gesetzt |
+| `502` | Vaultwarden lehnt das Anlegen ab, etwa durch eine Serverkonfiguration oder eine Organisationsrichtlinie. Die Meldung von Vaultwarden steht in `error` |
+| `503` | Das Master-Passwort ist nicht konfiguriert, und der Aufruf soll anlegen |
 
 ---
 
@@ -165,10 +173,10 @@ curl -X POST "$BASE/v1/orgs?apply=true" -H "Authorization: Bearer $TOKEN" \
 
 ### `GET /v1/orgs/{org}/members`
 
-Alle Mitglieder einer Organisation mit Rolle und Status. `{org}` ist Name oder ID.
+Liefert alle Mitglieder einer Organisation mit Rolle und Status. `{org}` ist die ID oder der Name der Organisation.
 
 ```bash
-curl -H "Authorization: Bearer $TOKEN" "$BASE/v1/orgs/Team%20Alpha/members"
+curl -H "Authorization: Bearer $KEY" "$BASE/v1/orgs/Team%20Alpha/members"
 ```
 
 ```json
@@ -176,28 +184,39 @@ curl -H "Authorization: Bearer $TOKEN" "$BASE/v1/orgs/Team%20Alpha/members"
   "id": "a73f7d38-1214-471f-8c8c-078db8723e2c",
   "name": "Team Alpha",
   "members": [
-    { "id": "5b1c...", "email": "alice@example.com", "role": "owner", "status": "confirmed" },
-    { "id": "9d42...", "email": "bob@example.com", "role": "custom", "status": "accepted" }
+    { "id": "5b1c0e7a-...", "email": "alice@example.com", "role": "owner",  "status": "confirmed" },
+    { "id": "9d42f3c1-...", "email": "bob@example.com",   "role": "custom", "status": "accepted" }
   ]
 }
 ```
 
-`id` im Mitglied ist die Mitgliedschafts-ID von Vaultwarden. Wer sie nicht braucht, kann sie ignorieren, alle Endpunkte arbeiten mit E-Mail-Adressen.
+`id` eines Mitglieds ist die Mitgliedschafts-ID von Vaultwarden. Alle Endpunkte des Dienstes arbeiten mit E-Mail-Adressen, die ID wird von Aufrufern normalerweise nicht gebraucht.
 
-Fehler: `404`, wenn die Org nicht existiert oder das API-Konto dort weder Owner noch Admin ist.
+**Fehler**
+
+| Code | Ursache |
+|---|---|
+| `404` | Die Organisation existiert nicht, oder das API-Konto ist dort weder Owner noch Admin |
+| `422` | Der Name ist mehrdeutig, siehe [Konventionen](#konventionen) |
 
 ### `GET /v1/export`
 
-Der Ist-Zustand aller verwaltbaren Orgs. Zusätzlich liefert die Antwort `desired` im Format des Sync-Bodys, gesperrte Mitglieder ausgenommen. Das ist die Vorlage, um den Zustand zu sichern oder zu editieren und an `/v1/sync` zurückzuschicken.
+Liefert den Ist-Zustand aller verwaltbaren Organisationen. Die Antwort enthält zusätzlich `desired` im Format des Bodys von `/v1/sync`. Der Block dient als Vorlage, um den Zustand zu sichern oder zu bearbeiten und anschließend zurückzuschicken.
 
 ```bash
-curl -H "Authorization: Bearer $TOKEN" $BASE/v1/export
+curl -H "Authorization: Bearer $KEY" $BASE/v1/export
 ```
 
 ```json
 {
   "orgs": [
-    { "id": "a73f...", "name": "Team Alpha", "members": [ { "id": "5b1c...", "email": "alice@example.com", "role": "owner", "status": "confirmed" } ] }
+    {
+      "id": "a73f7d38-...",
+      "name": "Team Alpha",
+      "members": [
+        { "id": "5b1c0e7a-...", "email": "alice@example.com", "role": "owner", "status": "confirmed" }
+      ]
+    }
   ],
   "desired": {
     "orgs": { "Team Alpha": { "members": { "alice@example.com": "owner" } } }
@@ -205,70 +224,81 @@ curl -H "Authorization: Bearer $TOKEN" $BASE/v1/export
 }
 ```
 
-Der `desired`-Teil ist garantiert ein Nichts-zu-tun-Plan: Schickst du ihn unverändert an `/v1/sync`, ändert sich nichts. Das gilt auch für gesperrte Mitglieder: Sie fehlen im `desired`, werden aber von `/v1/sync` nicht entfernt.
+Schickt der Aufrufer `desired` unverändert an `/v1/sync`, ändert sich nichts. Gesperrte Mitglieder fehlen in `desired`, der Abgleich lässt sie aber unangetastet.
 
 ---
 
 ## `POST /v1/sync`
 
-Stellt den Soll-Zustand her: Fehlende Personen einladen, abweichende Rollen angleichen, nicht gewünschte Mitglieder entfernen.
+Stellt den Soll-Zustand her. Der Dienst lädt fehlende Personen ein, gleicht abweichende Rollen an und entfernt Mitglieder, die nicht im Soll stehen.
 
 **Query**
 
-| Parameter | Standard | Bedeutung |
+| Parameter | Standard | Beschreibung |
 |---|---|---|
-| `apply` | `false` | `true` führt die Änderungen aus, sonst nur Plan |
-| `no_remove` | `false` | `true` entfernt nie jemanden |
-| `max_removals` | `5` | Löschbremse. Sind über alle Orgs mehr Entfernungen geplant, antwortet der Service mit `422` und ändert nichts |
+| `dry_run` | `false` | `true` führt nichts aus, die Antwort enthält nur den Plan |
+| `no_remove` | `false` | `true` entfernt niemanden |
+| `max_removals` | `5` | Obergrenze für Entfernungen. Sind über alle Organisationen mehr geplant, antwortet der Dienst mit `422` und ändert nichts |
 
 **Body**
 
 ```json
 {
   "orgs": {
-    "Team Alpha": { "members": { "alice@example.com": "admin", "bob@example.com": "custom" } },
+    "Team Alpha": {
+      "members": {
+        "alice@example.com": "admin",
+        "bob@example.com": "custom"
+      }
+    },
     "a73f7d38-1214-471f-8c8c-078db8723e2c": { "members": {} }
   }
 }
 ```
 
-- Der Org-Schlüssel ist Name oder ID.
-- Rollen: `owner`, `admin`, `manager`, `custom`, `user` ([Details](#rollen-und-status)).
-- Orgs, die nicht im Body stehen, werden nicht angefasst.
-- Eine Org mit leerer Mitgliederliste (`"members": {}`) bedeutet: alle entfernen außer dem API-Konto. Die Löschbremse fängt das ab.
-- Unbekannte JSON-Felder werden mit `400` abgelehnt, damit ein Tippfehler wie `"membres"` nicht still "alle entfernen" bedeutet.
+| Feld | Beschreibung |
+|---|---|
+| `orgs` | Objekt mit einer Organisation je Schlüssel. Der Schlüssel ist Name oder ID |
+| `orgs.<org>.members` | Objekt mit E-Mail-Adresse als Schlüssel und Rolle als Wert |
+
+Gültige Rollen sind `owner`, `admin`, `manager`, `custom` und `user`, siehe [Rollen und Status](#rollen-und-status).
 
 **Verhalten**
 
-- Das **API-Konto selbst** wird nie geändert oder entfernt, auch wenn es im Body steht oder fehlt.
-- **Gesperrte** Mitglieder (`revoked`) fasst der Service nie an: Er hebt die Sperre nicht auf und **entfernt sie auch nicht**, selbst wenn sie nicht im Soll stehen oder die Org leer sein soll. Sie erscheinen als Warnung in `warnings`. Entfernen kann sie nur ein Admin in Vaultwarden.
-- Bei **Rollenwechseln** bleiben bestehende Collection-Zuordnungen erhalten.
-- **Eingeladene und angenommene** Mitglieder zählen als Mitglieder: Stehen sie nicht im Soll, werden sie entfernt.
-- Das Planen ist **idempotent**: Nach einem erfolgreichen Lauf ist der nächste Plan leer.
-- Eine **fehlgeschlagene Änderung** stoppt die übrigen nicht. Wiederholen holt den Rest nach.
+- Organisationen, die nicht im Body stehen, bleiben unberührt.
+- Eine Organisation mit leerer Mitgliederliste (`"members": {}`) bedeutet, dass alle Mitglieder außer dem API-Konto entfernt werden sollen. Die Obergrenze `max_removals` schützt vor einem versehentlich leeren Soll.
+- Das API-Konto wird nie geändert oder entfernt, unabhängig davon, ob es im Body steht.
+- Gesperrte Mitglieder (`revoked`) bleiben unangetastet. Der Dienst hebt die Sperre nicht auf und entfernt sie nicht, auch wenn sie nicht im Soll stehen. Sie erscheinen in `warnings`.
+- Eingeladene und registrierte Mitglieder gelten als Mitglieder. Stehen sie nicht im Soll, werden sie entfernt.
+- Eine Person, die noch kein Konto hat, lädt der Dienst trotzdem ein. Vaultwarden legt dafür eine Einladung an, mit der sie sich registrieren kann. Das setzt voraus, dass Vaultwarden Einladungen erlaubt (`INVITATIONS_ALLOWED`, standardmäßig aktiv) und, falls eine Domain-Liste gesetzt ist, die Adresse dazu passt. Sonst schlägt die Änderung mit der Meldung von Vaultwarden fehl.
+- Bei einem Rollenwechsel bleiben bestehende Zuordnungen zu Sammlungen erhalten.
+- Eine fehlgeschlagene Änderung stoppt die übrigen nicht.
 
 ```bash
-# Erst ansehen ...
-curl -X POST $BASE/v1/sync -H "Authorization: Bearer $TOKEN" -d @soll.json
-# ... dann ausführen
-curl -X POST "$BASE/v1/sync?apply=true" -H "Authorization: Bearer $TOKEN" -d @soll.json
+# Vorschau
+curl -X POST "$BASE/v1/sync?dry_run=true" -H "Authorization: Bearer $KEY" -d @soll.json
+
+# Ausführen
+curl -X POST $BASE/v1/sync -H "Authorization: Bearer $KEY" -d @soll.json
 ```
 
-**Antwort `200`** (oder `207`, siehe unten)
+**Antwort `200` oder `207`**
 
 ```json
 {
   "dry_run": false,
-  "failures": 0,
+  "failures": 1,
   "plans": [
     {
-      "org": { "id": "a73f...", "name": "Team Alpha" },
+      "org": { "id": "a73f7d38-...", "name": "Team Alpha" },
       "changes": [
         { "type": "invite", "email": "carol@example.com", "role": "user" },
         { "type": "role",   "email": "bob@example.com",   "role": "custom", "from": "user" },
         { "type": "remove", "email": "dave@example.com" }
       ],
-      "warnings": [ "erin@example.com is revoked in \"Team Alpha\" and was skipped" ],
+      "warnings": [
+        "erin@example.com is revoked in \"Team Alpha\" and was skipped"
+      ],
       "results": [
         { "type": "invite", "email": "carol@example.com", "role": "user", "ok": true },
         { "type": "role",   "email": "bob@example.com",   "role": "custom", "from": "user", "ok": true },
@@ -279,60 +309,64 @@ curl -X POST "$BASE/v1/sync?apply=true" -H "Authorization: Bearer $TOKEN" -d @so
 }
 ```
 
-| Feld | Bedeutung |
+| Feld | Beschreibung |
 |---|---|
-| `dry_run` | `true`, wenn `apply` nicht gesetzt war |
-| `failures` | Anzahl fehlgeschlagener Änderungen |
-| `plans[].changes` | Was getan werden muss. Reihenfolge stabil: sortiert nach E-Mail, erst Einladen und Rollen, dann Entfernen |
-| `changes[].type` | `invite`, `role` oder `remove` |
-| `plans[].results` | Nur mit `apply=true`. Eine Zeile je Änderung mit `ok` und gegebenenfalls `error` |
-| `plans[].warnings` | Hinweise, zum Beispiel übersprungene gesperrte Mitglieder |
+| `dry_run` | `true`, wenn der Aufruf mit `dry_run=true` nur eine Vorschau lieferte |
+| `failures` | Anzahl der fehlgeschlagenen Änderungen. Bei `0` antwortet der Dienst mit `200`, sonst mit `207` |
+| `plans` | Eintrag je Organisation, nach Organisationsschlüssel sortiert |
+| `plans[].changes` | Geplante Änderungen, nach E-Mail sortiert. Zuerst kommen Einladungen und Rollenwechsel, danach Entfernungen |
+| `plans[].warnings` | Hinweise, etwa übersprungene gesperrte Mitglieder |
+| `plans[].results` | Nur bei einem ausführenden Aufruf. Ein Eintrag je Änderung mit `ok` und gegebenenfalls `error` |
+
+`changes[].type` ist `invite`, `role` oder `remove`. `role` nennt die Zielrolle, `from` bei einem Rollenwechsel die bisherige Rolle.
 
 **Fehler**
 
-| Code | Wann |
+| Code | Ursache |
 |---|---|
-| `207` | Lauf durchgeführt, aber `failures` > 0 |
-| `400` | Ungültiges JSON, unbekanntes Feld, unbekannte Rolle, ungültiger Query-Wert |
-| `404` | Eine Org aus dem Body gibt es nicht, oder das API-Konto ist dort weder Owner noch Admin. Es wird nichts geändert |
+| `207` | Der Lauf wurde ausgeführt, mindestens eine Änderung ist fehlgeschlagen |
+| `400` | Ungültiges JSON, unbekanntes Feld, unbekannte Rolle oder ungültiger Query-Wert |
+| `404` | Eine Organisation aus dem Body existiert nicht, oder das API-Konto ist dort weder Owner noch Admin. Es wird nichts geändert |
 | `409` | Ein anderer Schreiblauf läuft |
-| `422` | Ungültige oder doppelte E-Mail-Adresse, ein mehrdeutiger Org-Name, oder die Löschbremse hat ausgelöst |
-| `502` | Vaultwarden war nicht erreichbar oder hat die Planung abgelehnt |
+| `422` | Ungültige oder doppelte E-Mail-Adresse, mehrdeutiger Organisationsname oder Überschreitung von `max_removals` |
+| `502` | Vaultwarden ist nicht erreichbar oder lehnt die Abfrage ab |
 
 ---
 
 ## `POST /v1/confirm`
 
-Bestätigt Mitglieder, die ihre Einladung angenommen haben (Status `accepted`). Erst danach haben sie Zugriff auf die Daten der Org. Der Service entschlüsselt den Organisations-Key und verschlüsselt ihn für jedes Mitglied neu. Das braucht `VW_MASTER_PASSWORD`.
+Bestätigt Mitglieder, die sich in Vaultwarden registriert haben und den Status `accepted` tragen. Erst nach der Bestätigung haben sie Zugriff auf die Daten der Organisation. Der Dienst entschlüsselt den Organisations-Schlüssel und verschlüsselt ihn für jedes Mitglied neu. Dafür braucht er das Master-Passwort des API-Kontos.
 
-Der Service sucht in **allen** Orgs, die das API-Konto verwaltet.
+Wer sich noch nicht registriert hat, kann nicht bestätigt werden, weil für ihn noch kein öffentlicher Schlüssel existiert. Der Dienst lässt ihn unverändert und meldet ihn in `waiting`. Sobald sich die Person registriert, wechselt ihr Status von selbst auf `accepted`, und der nächste Aufruf bestätigt sie. Aufrufer können `confirm` deshalb regelmäßig mit derselben Adressliste senden.
+
+Der Dienst durchsucht alle Organisationen, die das API-Konto verwaltet.
 
 **Query**
 
-| Parameter | Standard | Bedeutung |
+| Parameter | Standard | Beschreibung |
 |---|---|---|
-| `apply` | `false` | `true` bestätigt wirklich. Der Dry-Run braucht kein Master-Passwort |
-| `all` | `false` | `true` bestätigt jeden wartenden Nutzer |
+| `dry_run` | `false` | `true` bestätigt niemanden und listet nur. Die Vorschau braucht kein Master-Passwort |
+| `all` | `false` | `true` bestätigt alle wartenden Mitglieder |
 
-**Body** (optional)
+**Body (optional)**
 
 ```json
 { "emails": ["alice@example.com", "bob@example.com"] }
 ```
 
-**Allowlist-Pflicht.** Beim Bestätigen vertraut der Service dem Public Key, den Vaultwarden für das Mitglied liefert. Wer den Server kontrolliert, könnte dort einen eigenen Schlüssel unterschieben. Deshalb muss jeder Aufruf entweder `emails` nennen oder ausdrücklich `all=true` setzen. Beides zugleich oder keins von beiden ergibt `400`. Wer nur Adressen bestätigen will, die er selbst eingeladen hat, nimmt `emails`.
+**Auswahl der Mitglieder.** Beim Bestätigen vertraut der Dienst dem öffentlichen Schlüssel, den Vaultwarden für das Mitglied liefert. Wer den Server kontrolliert, könnte dort einen fremden Schlüssel hinterlegen. Deshalb muss jeder Aufruf entweder `emails` nennen oder ausdrücklich `all=true` setzen. Beides zugleich oder keins von beiden ergibt `400`. Die Liste `emails` begrenzt die Bestätigung auf Adressen, die der Aufrufer selbst eingeladen hat.
 
 ```bash
-# Wer würde bestätigt?
-curl -X POST $BASE/v1/confirm -H "Authorization: Bearer $TOKEN" \
+# Vorschau
+curl -X POST "$BASE/v1/confirm?dry_run=true" -H "Authorization: Bearer $KEY" \
   -d '{"emails":["alice@example.com"]}'
 
 # Bestätigen
-curl -X POST "$BASE/v1/confirm?apply=true" -H "Authorization: Bearer $TOKEN" \
+curl -X POST $BASE/v1/confirm -H "Authorization: Bearer $KEY" \
   -d '{"emails":["alice@example.com"]}'
 ```
 
-**Antwort `200`** (oder `207`)
+**Antwort `200` oder `207`**
 
 ```json
 {
@@ -340,130 +374,157 @@ curl -X POST "$BASE/v1/confirm?apply=true" -H "Authorization: Bearer $TOKEN" \
   "failures": 0,
   "orgs": [
     {
-      "org": { "id": "a73f...", "name": "Team Alpha" },
+      "org": { "id": "a73f7d38-...", "name": "Team Alpha" },
       "pending": ["alice@example.com"],
+      "waiting": ["carol@example.com"],
       "results": [ { "email": "alice@example.com", "ok": true } ]
     }
   ]
 }
 ```
 
-- `orgs` enthält nur Orgs mit wartenden Mitgliedern. Ist niemand zu bestätigen, ist die Liste leer.
-- `pending` listet die Kandidaten, `results` gibt es nur mit `apply=true`.
-- Der Entsperrvorgang (PBKDF2 mit vielen Runden, oder Argon2id) läuft beim ersten Bestätigen und dauert kurz. Danach bleibt der Schlüssel im Speicher des Prozesses.
+| Feld | Beschreibung |
+|---|---|
+| `orgs` | Nur Organisationen mit bestätigbaren oder wartenden Mitgliedern. Gibt es keine, ist die Liste leer |
+| `orgs[].pending` | Adressen der registrierten Mitglieder (`accepted`), die jetzt bestätigt werden können |
+| `orgs[].waiting` | Adressen aus der Auswahl, die als Mitglied eingeladen, aber noch nicht registriert sind (`invited`). Bei `all=true` sind es alle solchen Mitglieder. Ein Tippfehler in `emails` erscheint hier nicht, denn nur tatsächliche Mitglieder werden gemeldet |
+| `orgs[].results` | Nur bei einem ausführenden Aufruf. Ein Eintrag je Mitglied mit `ok` und gegebenenfalls `error` |
+
+Beim ersten Bestätigen entsperrt der Dienst den Schlüssel des API-Kontos. Das dauert einen Moment. Der Schlüssel bleibt danach im Speicher des Prozesses. Gibt es nichts zu bestätigen, bleibt der Schlüssel gesperrt und der Aufruf braucht kein Master-Passwort.
 
 **Fehler**
 
-| Code | Wann |
+| Code | Ursache |
 |---|---|
 | `207` | Mindestens eine Bestätigung ist fehlgeschlagen |
-| `400` | Weder `emails` noch `all=true`, oder beides |
+| `400` | Weder `emails` noch `all=true` angegeben, oder beides |
 | `409` | Ein anderer Schreiblauf läuft |
-| `500` | `unlocking user key: MAC mismatch (wrong master password?)`: `VW_MASTER_PASSWORD` stimmt nicht |
-| `503` | `apply=true`, aber `VW_MASTER_PASSWORD` ist nicht gesetzt |
+| `500` | Das Master-Passwort ist falsch. Die Meldung lautet `unlocking user key: MAC mismatch (wrong master password?)` |
+| `503` | Das Master-Passwort ist nicht konfiguriert, und es gibt Mitglieder zu bestätigen |
 
 ---
 
+## Datentypen
+
+**Organisation**
+
+| Feld | Typ | Beschreibung |
+|---|---|---|
+| `id` | string | ID der Organisation |
+| `name` | string | Name der Organisation |
+
+**Mitglied**
+
+| Feld | Typ | Beschreibung |
+|---|---|---|
+| `id` | string | Mitgliedschafts-ID von Vaultwarden |
+| `email` | string | Adresse in Kleinbuchstaben |
+| `role` | string | `owner`, `admin`, `manager`, `custom`, `user` oder `unknown` |
+| `status` | string | `invited`, `accepted`, `confirmed` oder `revoked` |
+
+**Änderung**
+
+| Feld | Typ | Beschreibung |
+|---|---|---|
+| `type` | string | `invite`, `role` oder `remove` |
+| `email` | string | Betroffene Adresse |
+| `role` | string | Zielrolle bei `invite` und `role` |
+| `from` | string | Bisherige Rolle bei `role` |
+
 ## Rollen und Status
 
-**Rollen**
+### Rollen
 
 | Rolle | Bedeutung |
 |---|---|
-| `owner` | Besitzer der Org |
+| `owner` | Besitzer der Organisation |
 | `admin` | Administrator |
-| `custom` | Custom-Rolle mit "Alle Sammlungen verwalten": Sammlungen anlegen, bearbeiten und löschen. Sonst keine Rechte |
+| `custom` | Benutzerdefinierte Rolle mit der Berechtigung "Alle Sammlungen verwalten". Sie darf Sammlungen anlegen, bearbeiten und löschen und hat keine weiteren Rechte |
 | `manager` | Manager ohne diese Berechtigung |
-| `user` | normales Mitglied |
+| `user` | Normales Mitglied |
+| `unknown` | Ein Rollentyp, den der Dienst nicht kennt. Er erscheint nur in Antworten und lässt sich nicht setzen |
 
-Vaultwarden meldet `manager` und `custom` beide als Typ 4. Der Service unterscheidet sie über die drei Sammlungs-Berechtigungen. Wer `owner`, `admin`, `manager` oder `custom` vergeben will, muss selbst Owner der Org sein, das erlaubt Vaultwarden nicht anders.
+Vaultwarden meldet `manager` und `custom` beide mit dem Typ 4 und unterscheidet sie über die drei Sammlungs-Berechtigungen "anlegen", "bearbeiten" und "löschen". Der Dienst wertet genau diese aus.
 
-`manager` darf auf Vaultwarden 1.35 noch Sammlungen anlegen, ab 1.37 nicht mehr. Wenn die Sperre wichtig ist, nimm `user` oder `custom`.
+Die Rollen `owner`, `admin`, `manager` und `custom` kann in Vaultwarden nur ein Owner der Organisation vergeben. Ist das API-Konto nur Admin, schlägt die jeweilige Änderung mit einer Meldung von Vaultwarden fehl. Ob ein `manager` ohne die Berechtigung "Alle Sammlungen verwalten" trotzdem Sammlungen anlegen darf, hängt von der Vaultwarden-Version ab. Wer das ausschließen will, vergibt `user` oder `custom`.
 
-In Antworten kann außerdem `unknown` stehen: ein Typ, den der Service nicht kennt. Er lässt sich nicht setzen.
-
-**Status**
+### Status
 
 ```mermaid
 stateDiagram-v2
-    [*] --> invited: sync (invite)
-    invited --> accepted: Nutzer nimmt an
+    [*] --> invited: sync lädt eine Person ein, die noch nicht registriert ist
+    [*] --> accepted: sync lädt eine bereits registrierte Person ein
+    invited --> accepted: Person registriert sich
     accepted --> confirmed: confirm
-    confirmed --> [*]: sync (remove)
-    invited --> [*]: sync (remove)
-    accepted --> [*]: sync (remove)
     confirmed --> revoked: Admin sperrt
-    revoked --> confirmed: Admin hebt Sperre auf
+    revoked --> confirmed: Admin hebt auf
+    invited --> [*]: sync entfernt
+    accepted --> [*]: sync entfernt
+    confirmed --> [*]: sync entfernt
 ```
 
 | Status | Bedeutung |
 |---|---|
-| `invited` | Eingeladen, noch nicht angenommen |
-| `accepted` | Angenommen, wartet auf `confirm`. Ohne Zugriff auf die Daten |
-| `confirmed` | Volles Mitglied |
-| `revoked` | Gesperrt. `sync` lässt sie unverändert und meldet eine Warnung |
+| `invited` | Eingeladen, aber noch nicht registriert. Die Person hat noch kein Master-Passwort |
+| `accepted` | Registriert, wartet auf `confirm` und hat noch keinen Zugriff auf die Daten |
+| `confirmed` | Vollwertiges Mitglied |
+| `revoked` | Gesperrt. Der Dienst lässt solche Mitglieder unverändert |
 
-Ist bei Vaultwarden keine Mail konfiguriert, wird ein bereits registrierter Nutzer sofort `accepted`. Neue Nutzer müssen sich zuerst registrieren.
+Der Dienst ist für Vaultwarden ohne Mailversand ausgelegt. Niemand muss eine Einladung annehmen. Der Status hängt davon ab, ob sich die Person schon registriert hat.
 
----
+- **Bereits registriert.** Die Einladung setzt den Status sofort auf `accepted`.
+- **Noch nicht registriert.** Der Status bleibt `invited`. Registriert sich die Person später mit derselben Adresse, wechselt er von selbst auf `accepted`. Das gilt auch, wenn die allgemeine Registrierung in Vaultwarden abgeschaltet ist, denn die Einladung gestattet sie für diese Adresse. Die Person muss die Adresse und den Server selbst kennen, der Dienst benachrichtigt sie nicht.
 
 ## Typische Abläufe
 
-**Neue Org mit Mitgliedern**
+### Neue Organisation mit Mitgliedern
 
 ```mermaid
 sequenceDiagram
-    participant C as Dein Server
+    participant C as Aufrufer
     participant S as vwsync-api
     participant V as Vaultwarden
-    C->>S: POST /v1/auth/login
-    S-->>C: Token
-    C->>S: POST /v1/orgs?apply=true
-    S->>V: Org anlegen (Schlüssel verschlüsselt)
-    S-->>C: 201 mit id
-    C->>S: POST /v1/sync?apply=true
+    C->>S: POST /v1/orgs
+    S->>V: Organisation anlegen
+    S-->>C: 201 mit ID
+    C->>S: POST /v1/sync
     S->>V: Mitglieder einladen
     S-->>C: 200 mit Ergebnis
-    Note over V: Nutzer nehmen die Einladung an
-    C->>S: POST /v1/confirm?apply=true mit emails
+    Note over V: Nutzer registrieren sich und legen ihr Master-Passwort fest
+    C->>S: POST /v1/confirm mit emails
     S->>V: Mitglieder bestätigen
     S-->>C: 200
 ```
 
-**Laufender Abgleich per Cron**
+### Regelmäßiger Abgleich
 
-Auf deinem Server, alle 15 Minuten. Die Soll-Datei liegt dort, der Service hält keinen Zustand.
+Ein Skript auf dem Server des Aufrufers kann den Abgleich zyklisch ausführen. Der Dienst hält keinen Zustand, die Soll-Datei liegt beim Aufrufer. Weil `confirm` nur registrierte Personen bestätigt und die übrigen als wartend meldet, bestätigt derselbe Lauf neue Mitglieder automatisch, sobald sie sich registriert haben.
 
 ```bash
 #!/bin/sh
 set -eu
 BASE=https://vwsync.example.com
-TOKEN=$(curl -sf -X POST "$BASE/v1/auth/login" \
-  -d "{\"username\":\"sync\",\"password\":\"$VWSYNC_PASSWORD\"}" | jq -r .access_token)
-H="Authorization: Bearer $TOKEN"
+H="Authorization: Bearer $(cat /etc/vwsync/key)"
 
-curl -sf -X POST "$BASE/v1/sync?apply=true" -H "$H" -d @/etc/vwsync/soll.json
+curl -sf -X POST "$BASE/v1/sync" -H "$H" -d @/etc/vwsync/soll.json
 EMAILS=$(jq -c '[.orgs[].members | keys[]] | unique | {emails: .}' /etc/vwsync/soll.json)
-curl -sf -X POST "$BASE/v1/confirm?apply=true" -H "$H" -d "$EMAILS"
+curl -sf -X POST "$BASE/v1/confirm" -H "$H" -d "$EMAILS"
 ```
 
-Das Passwort gehört in eine Datei mit Rechten `0600` oder den Secret-Store, nicht in die Crontab. Bei jedem `207` oder Fehlercode sollte das Skript alarmieren. `curl -f` lässt es bei 4xx und 5xx fehlschlagen, `207` zählt als Erfolg und muss über `failures` im Body geprüft werden.
-
----
+Der Schlüssel gehört in eine Datei mit Rechten `0600` oder in einen Secret-Store, nicht in die Crontab. Die Option `-f` von curl lässt das Skript bei `4xx` und `5xx` scheitern. Die Antwort `207` zählt für curl als Erfolg. Ein produktives Skript prüft deshalb zusätzlich das Feld `failures` im Body.
 
 ## Statuscodes
 
 | Code | Bedeutung |
 |---|---|
-| `200` | Erfolgreich, auch ein Dry-Run |
-| `201` | Org angelegt |
-| `207` | Lauf durchgeführt, aber mindestens eine Änderung ist fehlgeschlagen. `failures` und `results[].error` nennen sie. Die übrigen Änderungen wurden ausgeführt |
-| `400` | Ungültiger Body oder Query. Unbekannte JSON-Felder zählen dazu |
-| `401` | Kein oder ungültiges oder abgelaufenes Token, oder falsche Zugangsdaten |
-| `404` | Org nicht gefunden, oder das API-Konto ist dort weder Owner noch Admin |
-| `409` | Ein anderer Schreiblauf läuft, oder die Org existiert schon |
-| `422` | Inhaltlich ungültig: E-Mail, Orgname, mehrdeutiger Orgname, Löschbremse |
-| `429` | Zu viele fehlgeschlagene Logins. `Retry-After` beachten |
-| `500` | Interner Fehler oder falsches Master-Passwort. Die Meldung steht in `error`, Details im Log |
-| `502` | Vaultwarden hat den Aufruf abgelehnt oder war nicht erreichbar |
-| `503` | `VW_MASTER_PASSWORD` fehlt für eine Aktion, die es braucht |
+| `200` | Erfolgreich, auch bei einer Vorschau mit `dry_run=true` |
+| `201` | Organisation angelegt |
+| `207` | Der Lauf wurde ausgeführt, mindestens eine Änderung ist fehlgeschlagen. `failures` und `results[].error` nennen sie. Die übrigen Änderungen sind ausgeführt |
+| `400` | Ungültiger Body oder ungültige Query. Dazu zählen unbekannte JSON-Felder und der nicht unterstützte Parameter `apply` |
+| `401` | Der Zugangsschlüssel fehlt oder ist falsch |
+| `404` | Organisation nicht gefunden, oder das API-Konto ist dort weder Owner noch Admin |
+| `409` | Ein anderer Schreiblauf läuft, oder die Organisation existiert bereits |
+| `422` | Inhaltlich ungültig, etwa E-Mail-Adresse, Organisationsname, mehrdeutiger Name oder `max_removals` |
+| `500` | Interner Fehler oder falsches Master-Passwort. Die Meldung steht in `error`, Details stehen im Log |
+| `502` | Vaultwarden hat den Aufruf abgelehnt oder ist nicht erreichbar |
+| `503` | Das Master-Passwort ist nicht konfiguriert, obwohl die Aktion es braucht |

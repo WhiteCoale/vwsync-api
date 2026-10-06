@@ -7,14 +7,14 @@ import (
 	"fmt"
 )
 
-// KeyVault holds the unlocked RSA private key of the API account in memory.
-// The key never leaves this type and is never written anywhere.
+// KeyVault hält den entsperrten privaten RSA-Schlüssel des API-Kontos im Speicher.
+// Der Schlüssel verlässt diesen Typ nie und wird nirgends gespeichert.
 type KeyVault struct {
 	priv *rsa.PrivateKey
 }
 
-// Unlock derives the keys from the master password and decrypts the account's private key.
-// encUserKey and encPrivateKey come from the API-key login response.
+// Unlock leitet die Schlüssel aus dem Master-Passwort ab und entschlüsselt den privaten Schlüssel
+// des Kontos. encUserKey und encPrivateKey stammen aus der Antwort des Logins mit API-Key.
 func Unlock(encUserKey, encPrivateKey, masterPassword, email string, kdf KDFParams) (*KeyVault, error) {
 	masterKey, err := DeriveMasterKey(masterPassword, email, kdf)
 	if err != nil {
@@ -24,7 +24,7 @@ func Unlock(encUserKey, encPrivateKey, masterPassword, email string, kdf KDFPara
 	if err != nil {
 		return nil, err
 	}
-	// A wrong master password fails here, at the MAC check.
+	// Ein falsches Master-Passwort scheitert hier, an der MAC-Prüfung.
 	userKey, err := DecryptSymmetric(encUserKey, stretched)
 	if err != nil {
 		return nil, fmt.Errorf("unlocking user key: %w", err)
@@ -40,13 +40,13 @@ func Unlock(encUserKey, encPrivateKey, masterPassword, email string, kdf KDFPara
 	return &KeyVault{priv: priv}, nil
 }
 
-// OrganizationKey decrypts an organization's key (the "key" field from /api/accounts/profile).
+// OrganizationKey entschlüsselt den Schlüssel einer Organisation (Feld "key" aus /api/accounts/profile).
 func (v *KeyVault) OrganizationKey(encryptedOrgKey string) ([]byte, error) {
 	return DecryptAsymmetric(encryptedOrgKey, v.priv)
 }
 
-// PublicKeyB64 is the account's RSA public key as base64 DER/SPKI, the format the API uses.
-// It is derived from the private key, so it is never stale.
+// PublicKeyB64 ist der öffentliche RSA-Schlüssel des Kontos als Base64 DER/SPKI, im Format der API.
+// Er wird aus dem privaten Schlüssel abgeleitet und ist deshalb immer aktuell.
 func (v *KeyVault) PublicKeyB64() (string, error) {
 	der, err := x509.MarshalPKIXPublicKey(&v.priv.PublicKey)
 	if err != nil {

@@ -7,7 +7,8 @@ import (
 	"vwsync-api/internal/model"
 )
 
-// OrgAmbiguousError means a name matches several organizations that differ only in letter case.
+// OrgAmbiguousError bedeutet, dass ein Name auf mehrere Organisationen passt, die sich nur in der
+// Groß- und Kleinschreibung unterscheiden.
 type OrgAmbiguousError struct {
 	Key string
 	IDs []string
@@ -17,9 +18,9 @@ func (e *OrgAmbiguousError) Error() string {
 	return fmt.Sprintf("organization name %q matches several organizations (%s); use the id", e.Key, strings.Join(e.IDs, ", "))
 }
 
-// FindOrg resolves an org by id or name. The id must match exactly. A name matches without regard to
-// letter case, so "team alpha" finds "Team Alpha". If several orgs match that way, an exact spelling
-// wins, otherwise the lookup is ambiguous and the caller has to use the id.
+// FindOrg sucht eine Org über ID oder Namen. Die ID muss exakt passen. Ein Name passt ohne Beachtung
+// der Groß- und Kleinschreibung, "team alpha" findet also "Team Alpha". Passen so mehrere Orgs,
+// gewinnt die exakte Schreibweise. Sonst ist die Suche mehrdeutig, und der Aufrufer muss die ID nehmen.
 func FindOrg(orgs []model.Organization, key string) (model.Organization, error) {
 	for _, o := range orgs {
 		if o.ID == key {

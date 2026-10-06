@@ -16,7 +16,7 @@ func TestNewOrganizationKeys(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// The owner recovers the org key with their private key, and with it everything else.
+	// Der Owner gewinnt den Org-Schlüssel mit seinem privaten Schlüssel zurück und damit alles andere.
 	orgKey, err := DecryptAsymmetric(o.Key, owner)
 	if err != nil || len(orgKey) != 64 {
 		t.Fatalf("org key: %d bytes, %v", len(orgKey), err)
@@ -37,7 +37,7 @@ func TestNewOrganizationKeys(t *testing.T) {
 		t.Fatal("published key does not belong to the encrypted private key")
 	}
 
-	// Two organizations never share key material.
+	// Zwei Organisationen teilen nie Schlüsselmaterial.
 	o2, _ := NewOrganizationKeys("c", base64.StdEncoding.EncodeToString(ownerPub))
 	if o2.PublicKey == o.PublicKey {
 		t.Fatal("key pair reused")

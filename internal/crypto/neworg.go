@@ -8,23 +8,23 @@ import (
 	"fmt"
 )
 
-// NewOrg is the key material the client must generate when it creates an organization.
-// The server never sees the organization key in the clear.
+// NewOrg ist das Schlüsselmaterial, das der Client beim Anlegen einer Organisation erzeugen muss.
+// Der Server sieht den Organisations-Schlüssel nie im Klartext.
 type NewOrg struct {
-	// Key is the organization key, RSA-encrypted for the creating account.
+	// Key ist der Organisations-Schlüssel, per RSA für das anlegende Konto verschlüsselt.
 	Key string
-	// CollectionName is the first collection's name, encrypted with the organization key.
+	// CollectionName ist der Name der ersten Sammlung, verschlüsselt mit dem Organisations-Schlüssel.
 	CollectionName string
-	// PublicKey and EncryptedPrivateKey are the organization's own RSA key pair
-	// (SPKI base64, and PKCS#8 encrypted with the organization key).
+	// PublicKey und EncryptedPrivateKey sind das eigene RSA-Schlüsselpaar der Organisation
+	// (SPKI in Base64 und PKCS#8, verschlüsselt mit dem Organisations-Schlüssel).
 	PublicKey           string
 	EncryptedPrivateKey string
 }
 
-// NewOrganizationKeys generates a fresh organization key and key pair for the account that owns
-// the given public key (base64 DER/SPKI).
+// NewOrganizationKeys erzeugt einen neuen Organisations-Schlüssel samt Schlüsselpaar für das Konto,
+// dem der übergebene öffentliche Schlüssel (Base64 DER/SPKI) gehört.
 func NewOrganizationKeys(collectionName, ownerPublicKeyB64 string) (NewOrg, error) {
-	orgKey := make([]byte, 64) // 32 bytes AES-256 + 32 bytes HMAC
+	orgKey := make([]byte, 64) // 32 Byte AES-256 und 32 Byte HMAC
 	if _, err := rand.Read(orgKey); err != nil {
 		return NewOrg{}, err
 	}

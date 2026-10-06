@@ -1,88 +1,110 @@
 # vwsync-api
 
-REST-Service in Go, der Organisationen, Mitglieder und Rollen eines Vaultwarden-Servers mit einem Soll-Zustand abgleicht. Ein anderer Server ruft ihn per HTTPS auf, nach Login mit Benutzername und Passwort.
+vwsync-api ist ein REST-Dienst in Go für die Verwaltung von Vaultwarden-Organisationen. Ein Aufrufer beschreibt den gewünschten Zustand aus Organisationen, Mitgliedern und Rollen, und der Dienst stellt ihn her. Er lädt ein, ändert Rollen, entfernt Mitglieder, bestätigt registrierte Mitglieder und legt Organisationen an. Der Zugriff erfolgt per HTTPS mit einem festen Zugangsschlüssel.
 
-Der Service schreibt **nicht** direkt in die Datenbank. Er spricht mit der Vaultwarden-API über einen persönlichen API-Key. Nur so bleiben Einladungs-Mails, Plausibilitätsprüfungen und die Ende-zu-Ende-Verschlüsselung beim Bestätigen intakt.
+Der Dienst läuft auf einem eigenen Server und ruft Vaultwarden über HTTPS auf einem anderen Server auf. Er arbeitet ausschließlich über die Benutzer-API von Vaultwarden, mit dem persönlichen API-Key eines dafür vorgesehenen Kontos, und schreibt nie in die Datenbank. Die Prüfungen des Servers und die Ende-zu-Ende-Verschlüsselung beim Bestätigen bleiben dadurch erhalten. Ein Mailserver ist nicht nötig. Niemand muss eine Einladung annehmen, eine Person muss sich nur in Vaultwarden registrieren und damit ihr Master-Passwort festlegen.
 
 | Dokument | Inhalt |
 |---|---|
-| [SETUP.md](SETUP.md) | Installation auf einem Linux-Server mit systemd und nginx, Betrieb, Fehlersuche |
-| [docs/API.md](docs/API.md) | Alle Endpunkte mit Parametern, Beispielen, Antworten und Statuscodes |
-| [.env.example](.env.example) | Konfigurationsvorlage |
+| [SETUP.md](SETUP.md) | Installation auf Linux mit systemd und nginx, Betrieb und Fehlersuche |
+| [docs/API.md](docs/API.md) | Referenz aller Endpunkte mit Parametern, Beispielen und Statuscodes |
+| [.env.example](.env.example) | Vorlage für die Konfiguration |
 
-## Überblick
+## Funktionen
+
+| Endpunkt | Zweck |
+|---|---|
+| `GET /v1/orgs` | Verwaltbare Organisationen auflisten |
+| `POST /v1/orgs` | Organisation anlegen |
+| `GET /v1/orgs/{org}/members` | Mitglieder einer Organisation mit Rolle und Status |
+| `GET /v1/export` | Ist-Zustand aller Organisationen, zugleich Vorlage für den Abgleich |
+| `POST /v1/sync` | Einladen, Rollen ändern und Entfernen nach Soll-Zustand |
+| `POST /v1/confirm` | Mitglieder bestätigen, die sich registriert haben |
+
+Unterstützte Rollen sind `owner`, `admin`, `manager`, `custom` (mit der Berechtigung "Alle Sammlungen verwalten") und `user`.
+
+## Schnellstart
+
+Die vollständige Anleitung steht in [SETUP.md](SETUP.md). Kurzfassung für eine Entwicklungsumgebung:
+
+```bash
+go build -o vwsync-api ./cmd/vwsync-api
+./vwsync-api generate-key           # gibt den Zugangsschlüssel und die Zeile für die Konfiguration aus
+cp .env.example .env                # Werte eintragen, darunter VWSYNC_API_KEY_HASH aus dem letzten Schritt
+set -a; . ./.env; set +a            # Datei als Umgebungsvariablen laden
+./vwsync-api serve
+```
+
+Anschließend ruft ein Aufrufer die Endpunkte mit dem Zugangsschlüssel auf.
+
+```bash
+KEY=vwsk_...    # Ausgabe von generate-key
+curl -H "Authorization: Bearer $KEY" http://127.0.0.1:8080/v1/orgs
+```
+
+## Architektur
 
 ```mermaid
 flowchart LR
-    subgraph caller["Dein Server"]
+    subgraph caller["Server des Aufrufers"]
         job["Skript oder Cron"]
     end
 
-    subgraph host["Linux-Server"]
-        nginx["nginx<br/>TLS, Rate-Limit"]
+    subgraph host["vwsync-Server (Linux)"]
+        nginx["nginx<br/>TLS, Begrenzung"]
         subgraph svc["vwsync-api (systemd)"]
-            auth["Login und Token"]
+            auth["Prüfung des<br/>Zugangsschlüssels"]
             http["REST-Endpunkte"]
             logic["Abgleich<br/>Plan und Ausführung"]
             vault["Schlüsseltresor<br/>nur im Speicher"]
         end
     end
 
-    vw["Vaultwarden<br/>Benutzer-API"]
+    subgraph vwhost["Vaultwarden-Server (Linux, systemd)"]
+        vw["Vaultwarden<br/>Benutzer-API"]
+    end
 
-    job -- "HTTPS, Bearer-Token" --> nginx
+    job -- "HTTPS, Zugangsschlüssel" --> nginx
     nginx -- "127.0.0.1:8080" --> auth
     auth --> http --> logic
-    logic -- "API-Key" --> vw
+    logic -- "HTTPS, API-Key" --> vw
     logic -. "nur confirm und Org anlegen" .-> vault
     vault -. "Master-Passwort" .-> vw
 ```
 
-## Was der Service kann
+nginx terminiert TLS und begrenzt Anfragen. Der Dienst lauscht nur auf der lokalen Schleife. Er hält keinen Zustand auf der Platte, der Soll-Zustand liegt beim Aufrufer. Die Verbindung zu Vaultwarden muss HTTPS nutzen, der Dienst lehnt unverschlüsseltes HTTP außer für `localhost` ab.
 
-| Endpunkt | Zweck |
-|---|---|
-| `POST /v1/auth/login` | Anmelden, liefert ein Token |
-| `GET /v1/orgs` | Verwaltbare Organisationen auflisten |
-| `POST /v1/orgs` | Organisation anlegen |
-| `GET /v1/orgs/{org}/members` | Mitglieder mit Rolle und Status |
-| `GET /v1/export` | Ist-Zustand aller Orgs, als Vorlage für den Sync |
-| `POST /v1/sync` | Einladen, Rollen ändern, Entfernen nach Soll-Zustand |
-| `POST /v1/confirm` | Mitglieder bestätigen, die ihre Einladung angenommen haben |
+## Ablauf
 
-Rollen: `owner`, `admin`, `manager`, `custom` ("Alle Sammlungen verwalten") und `user`. Details in [docs/API.md](docs/API.md).
-
-## Ablauf: von der neuen Org zum bestätigten Mitglied
+Von der neuen Organisation bis zum bestätigten Mitglied durchläuft ein Aufrufer diese Schritte. Die Person kann sich vor oder nach der Einladung in Vaultwarden registrieren.
 
 ```mermaid
 sequenceDiagram
-    participant C as Dein Server
+    participant C as Aufrufer
     participant S as vwsync-api
     participant V as Vaultwarden
     participant U as Nutzer
 
-    C->>S: POST /v1/auth/login
-    S-->>C: Token
-    C->>S: POST /v1/orgs?apply=true
+    C->>S: POST /v1/orgs
     S->>V: Org anlegen, Schlüssel verschlüsselt
     S-->>C: 201 mit Org-ID
-    C->>S: POST /v1/sync?apply=true
+    C->>S: POST /v1/sync
     S->>V: Einladen, Rollen setzen, Entfernen
     S-->>C: 200 mit Ergebnis je Änderung
-    V-->>U: Einladung
-    U->>V: nimmt an
-    C->>S: POST /v1/confirm?apply=true
+    U->>V: registriert sich und legt das Master-Passwort fest
+    C->>S: POST /v1/confirm
     S->>V: Org-Key für das Mitglied verschlüsseln und bestätigen
     S-->>C: 200
-    Note over U,V: Das Mitglied hat jetzt Zugriff
+    Note over U,V: Das Mitglied hat Zugriff
 ```
 
-Ein Mitglied durchläuft diese Zustände. Der Service setzt die Übergänge `sync` und `confirm`, den Rest machen der Nutzer oder ein Admin in Vaultwarden:
+Ein Mitglied durchläuft dabei diese Zustände. Der Dienst löst die Übergänge durch `sync` und `confirm` aus. Die Registrierung nimmt die Person selbst vor, Sperren setzt und hebt ein Admin in Vaultwarden auf. Bestätigen lässt sich nur, wer sich registriert hat, denn erst dann gibt es einen öffentlichen Schlüssel, für den der Organisations-Schlüssel verschlüsselt werden kann. Wer noch nicht registriert ist, bleibt `invited`. `confirm` meldet diese Personen als wartend, und ein späterer Aufruf bestätigt sie.
 
 ```mermaid
 stateDiagram-v2
-    [*] --> invited: sync lädt ein
-    invited --> accepted: Nutzer nimmt an
+    [*] --> invited: sync lädt eine Person ein, die noch nicht registriert ist
+    [*] --> accepted: sync lädt eine bereits registrierte Person ein
+    invited --> accepted: Person registriert sich
     accepted --> confirmed: confirm
     confirmed --> revoked: Admin sperrt
     revoked --> confirmed: Admin hebt auf
@@ -91,47 +113,53 @@ stateDiagram-v2
     confirmed --> [*]: sync entfernt
 ```
 
-## Sicherheitsnetze
+## Schutzmechanismen beim Abgleich
 
-- **Dry-Run ist Standard.** Alle schreibenden Endpunkte ändern erst mit `apply=true` etwas.
-- **Löschbremse.** Mehr als `max_removals` (Standard 5) geplante Entfernungen brechen vor jeder Änderung ab. `no_remove=true` verbietet Entfernen ganz.
-- **Das API-Konto wird nie geändert oder entfernt.** Gesperrte Mitglieder auch nicht: Sie werden nie entfernt, auch nicht bei einer leeren Soll-Liste, und der Export lässt sich gefahrlos zurückschicken.
-- **Kein stilles Löschen durch Tippfehler.** Unbekannte JSON-Felder werden abgelehnt.
-- **Confirm mit Allowlist.** Der Aufruf muss die E-Mail-Adressen nennen oder ausdrücklich `all=true` setzen, weil beim Bestätigen dem Public Key vertraut wird, den der Server liefert.
-- **Keine doppelten Orgs.** Vaultwarden erzwingt keine eindeutigen Namen. Der Service prüft vorher.
-- **Ein Schreiblauf zugleich.** Ein zweiter bekommt `409`. Ein abgebrochener Aufruf lässt keinen halb ausgeführten Lauf zurück.
-- **Teilfehler stoppen den Lauf nicht.** Antwort `207` mit `failures`. Ein erneuter Aufruf holt den Rest nach, weil die Planung idempotent ist.
-- Rollenwechsel behalten bestehende Collection-Zugriffe.
+- **Vorschau auf Wunsch.** Die schreibenden Endpunkte führen aus, was sie erhalten. Mit `dry_run=true` zeigen sie nur, was geschehen würde, und ändern nichts. Die Antwort hat in beiden Fällen denselben Aufbau.
+- **Obergrenze für Entfernungen.** Plant ein Lauf mehr als `max_removals` Entfernungen (Standard 5, gezählt über alle Organisationen), bricht er vor der ersten Änderung ab. Mit `no_remove=true` entfernt der Dienst niemanden.
+- **Geschützte Konten.** Das API-Konto wird nie geändert oder entfernt. Gesperrte Mitglieder bleiben immer unangetastet, auch bei leerem Soll-Zustand. Der Export lässt sich deshalb gefahrlos zurückschicken.
+- **Strikte Eingabe.** Unbekannte JSON-Felder werden abgelehnt. Ein Tippfehler im Feldnamen kann so nicht als leere Mitgliederliste gelten.
+- **Bestätigung mit Auswahl.** `confirm` verlangt entweder eine Liste von E-Mail-Adressen oder ausdrücklich `all=true`, weil beim Bestätigen dem öffentlichen Schlüssel vertraut wird, den der Server liefert.
+- **Nur Registrierte werden bestätigt.** Wer sich noch nicht registriert hat, bleibt unverändert und erscheint als wartend. Ein Aufruf ohne bestätigbare Mitglieder braucht kein Master-Passwort.
+- **Keine doppelten Organisationen.** Vaultwarden erzwingt keine eindeutigen Namen. Der Dienst prüft den Namen vor dem Anlegen.
+- **Ein Schreiblauf zugleich.** Ein zweiter Lauf erhält `409`. Ein abgebrochener Aufruf hinterlässt keinen halb ausgeführten Lauf.
+- **Teilfehler.** Eine fehlgeschlagene Änderung stoppt die übrigen nicht. Die Antwort `207` nennt die Fehler. Weil der Abgleich idempotent ist, holt ein erneuter Aufruf den Rest nach.
+- **Erhalt von Zugriffen.** Rollenwechsel behalten bestehende Zuordnungen zu Sammlungen.
 
 ## Sicherheit des Dienstes
 
-- **Login:** ein Benutzer aus der Umgebung, Passwort als bcrypt-Hash. Der Hash wird auch bei falschem Benutzernamen berechnet, damit die Antwortzeit nichts verrät.
-- **Token:** HS256-JWT, standardmäßig 15 Minuten gültig. Es gibt keine Sperrliste. Wer alle Tokens sofort entwerten will, ändert `VWSYNC_JWT_SECRET` und startet neu.
-- **Rate-Limit:** 5 fehlgeschlagene Logins pro Minute und Client im Dienst, dazu nginx. IPv6-Clients zählen je /64-Netz, der Speicher des Limiters ist begrenzt. `X-Real-IP` wird nur von Loopback geglaubt.
-- **Master-Passwort:** nur für `confirm` und `POST /v1/orgs`. Der entsperrte Schlüssel bleibt im Arbeitsspeicher, solange der Prozess läuft. Ohne `VW_MASTER_PASSWORD` sind diese beiden Funktionen aus.
-- **Logs:** nie Header, Bodies, Tokens oder Passwörter. Jede ausgeführte Änderung steht als `audit`-Zeile im Log, Panics mit Stacktrace. Level und Format (`json`) sind einstellbar.
-- **Rechte:** Der Dienst kann alles, was das API-Konto in den Orgs darf. Nimm ein eigenes Konto dafür.
-- **systemd-Härtung:** eigener Benutzer, schreibgeschütztes Dateisystem, keine Capabilities, eingeschränkte Systemaufrufe.
+- **Zugangsschlüssel.** Aufrufer senden einen festen Schlüssel mit 256 Bit Zufall im Header `Authorization: Bearer`. Der Dienst speichert nur dessen SHA-256-Hash und vergleicht in konstanter Zeit. Es gibt keinen Login und keine Sitzungen. Der Schlüssel läuft nicht ab. Wer ihn sperren will, entfernt seinen Hash aus der Konfiguration. Mehrere Hashes gelten gleichzeitig, damit sich ein Schlüssel ohne Unterbrechung austauschen lässt. Ein Schlüssel in der URL wird nicht akzeptiert.
+- **Abgewiesene Aufrufe.** Sie erscheinen mit der Adresse des Aufrufers im Log (`request rejected`), nie mit dem Schlüssel. nginx begrenzt die Anfragen je Adresse. `X-Real-IP` gilt nur für Anfragen von der lokalen Schleife.
+- **Verbindung zu Vaultwarden.** Der Dienst verlangt HTTPS für `VW_URL`, außer für `localhost`. API-Key und Schlüsselmaterial gehen so nie unverschlüsselt über das Netz. Bei einem Zertifikat einer internen CA trägt `VW_CA_FILE` die zusätzlichen Zertifizierungsstellen ein, die Prüfung bleibt aktiv.
+- **Master-Passwort.** Es wird nur für `confirm` und für das Anlegen von Organisationen gebraucht. Der entsperrte Schlüssel bleibt im Arbeitsspeicher, solange der Prozess läuft. Ohne das Master-Passwort sind diese beiden Funktionen abgeschaltet, alles andere funktioniert.
+- **Logs.** Der Dienst schreibt nie Header, Bodies, Schlüssel oder Passwörter ins Log. Jede ausgeführte Änderung erscheint als Zeile `audit`. Panics werden mit Stacktrace protokolliert, der Aufrufer erhält nur eine Referenz.
+- **Rechte.** Der Dienst darf alles, was sein API-Konto in den Organisationen darf. Das Konto sollte ausschließlich dem Dienst dienen.
+- **Härtung.** Die mitgelieferte systemd-Unit startet den Dienst unter einem eigenen Benutzer, mit schreibgeschütztem Dateisystem, ohne Capabilities und mit eingeschränkten Systemaufrufen.
 
-## Getestet gegen
+## Konfiguration
 
-| Vaultwarden | Unit-Tests | End-to-End |
+Der Dienst liest seine Konfiguration aus Umgebungsvariablen. Die vollständige Liste mit Erläuterungen steht in [SETUP.md](SETUP.md#5-konfiguration-schreiben), eine Vorlage in [.env.example](.env.example).
+
+| Variable | Pflicht | Zweck |
 |---|---|---|
-| 1.35.4 | ja | ja |
-| 1.37.1 | ja | ja |
-| 1.37.3 | ja | ja |
-
-Der End-to-End-Test startet die echte Binary gegen eine frische Vaultwarden-Instanz und prüft den ganzen Ablauf: Login, Org anlegen, Einladen, Bestätigen, Rollenwechsel, Entfernen und die Rechte der Rolle `custom`. Mit der Original-Bitwarden-CLI als unabhängigem Client wird zusätzlich geprüft, dass die erzeugten Konten und Orgs lesbar sind, auch mit Argon2id.
+| `VWSYNC_API_KEY_HASH` | ja | SHA-256-Hash des Zugangsschlüssels, bei mehreren Schlüsseln kommagetrennt |
+| `VW_URL`, `VW_CLIENT_ID`, `VW_CLIENT_SECRET` | ja | Vaultwarden und API-Key des Dienstkontos |
+| `VW_MASTER_PASSWORD` | nein | Für `confirm` und `POST /v1/orgs` |
+| `VW_CA_FILE` | nein | PEM-Datei mit zusätzlichen Zertifizierungsstellen für `VW_URL` |
+| `VWSYNC_LISTEN`, `VWSYNC_TRUST_PROXY` | nein | Adresse, Vertrauen in `X-Real-IP` für die Adresse im Log |
+| `VWSYNC_LOG_LEVEL`, `VWSYNC_LOG_FORMAT` | nein | Log-Level und Format (`text` oder `json`) |
 
 ## Entwicklung
 
 ```bash
-make test       # go vet + go test -race, ohne Netzwerk
-make e2e        # End-to-End gegen ein Wegwerf-Vaultwarden
-make linux      # statisches Linux-Binary in dist/, Version aus git describe (VERSION=v1.2.0 überschreibt)
+make test       # go vet und go test -race, ohne Netzwerk
+make e2e        # End-to-End-Tests gegen eine Vaultwarden-Testinstanz
+make linux      # statisches Linux-Binary in dist/
 ```
 
-`make e2e` braucht eine laufende Wegwerf-Instanz. Der Test registriert eigene Konten mit Zufallspasswörtern und nutzt `bw` (falls installiert) mit eigenem Datenverzeichnis, nie mit deiner Konfiguration:
+`make linux` übernimmt die Version aus `git describe`. Mit `make linux VERSION=v1.2.0` lässt sie sich festlegen. `vwsync-api version` gibt sie aus.
+
+Die End-to-End-Tests starten das echte Binary und führen den gesamten Ablauf gegen eine frische Vaultwarden-Instanz aus. Sie registrieren eigene Konten mit zufälligen Passwörtern. Ist die Bitwarden-CLI (`bw`) installiert, dient sie als unabhängiger Client und liest die erzeugten Konten und Organisationen mit eigenem Datenverzeichnis. Eine Testinstanz startet so:
 
 ```bash
 docker run -d --rm --name vwsync-e2e -p 127.0.0.1:18082:80 \
@@ -140,14 +168,14 @@ docker run -d --rm --name vwsync-e2e -p 127.0.0.1:18082:80 \
   vaultwarden/server:latest
 ```
 
-Die Pakete bauen aufeinander auf. Pfeile zeigen, wer wen nutzt:
+Aufbau der Pakete. Pfeile zeigen, wer wen verwendet.
 
 ```mermaid
 flowchart TD
-    main["cmd/vwsync-api<br/>serve, hash-password"] --> server
+    main["cmd/vwsync-api<br/>serve, generate-key"] --> server
     main --> config["internal/config<br/>Umgebungsvariablen"]
     main --> vwc
-    server["internal/server<br/>Routen, Fehlerabbildung, Schreibsperre"] --> auth["internal/auth<br/>Login, Token, Rate-Limit"]
+    server["internal/server<br/>Routen, Fehlerabbildung, Schreibsperre"] --> auth["internal/auth<br/>Zugangsschlüssel"]
     server --> reconcile["internal/reconcile<br/>Planner, Sync, Confirm, Org anlegen"]
     reconcile --> model["internal/model<br/>Role, Status, Member, Organization"]
     vwc["internal/vaultwarden<br/>API-Client, Schlüsseltresor"] --> model
@@ -155,4 +183,4 @@ flowchart TD
     vwc -. "erfüllt Directory" .-> reconcile
 ```
 
-Die Diff-Logik (`Planner`) ist eine reine Funktion ohne Netzwerk. Das macht sie vollständig per Unit-Test prüfbar.
+Die Diff-Logik im Paket `reconcile` ist eine reine Funktion ohne Netzwerkzugriff. Unit-Tests decken sie vollständig ab.

@@ -9,7 +9,7 @@ import (
 )
 
 type createDir struct {
-	Directory // unused methods panic, which proves CreateOrg does not call them
+	Directory // nicht implementierte Methoden lösen einen Panic aus, das belegt, dass CreateOrg sie nicht aufruft
 	orgs      []model.Organization
 	created   []string
 }

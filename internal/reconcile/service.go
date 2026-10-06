@@ -8,7 +8,8 @@ import (
 	"vwsync-api/internal/model"
 )
 
-// Directory is the part of the Vaultwarden client the service needs. Tests replace it with a fake.
+// Directory ist der Teil des Vaultwarden-Clients, den der Service braucht. Tests ersetzen ihn durch
+// eine Attrappe.
 type Directory interface {
 	Profile(ctx context.Context) (model.Profile, error)
 	SelfEmail(ctx context.Context) (string, error)
@@ -21,19 +22,20 @@ type Directory interface {
 	CreateOrganization(ctx context.Context, name, billingEmail string) (model.Organization, error)
 }
 
-// OrgKeys decrypts organization keys. Satisfied by *crypto.KeyVault.
+// OrgKeys entschlüsselt Organisations-Schlüssel. *crypto.KeyVault erfüllt das Interface.
 type OrgKeys interface {
 	OrganizationKey(encryptedOrgKey string) ([]byte, error)
 }
 
-// OrgNotFoundError means a desired org does not exist, or the API account is not owner/admin there.
+// OrgNotFoundError bedeutet, dass eine gewünschte Org nicht existiert oder das API-Konto dort weder
+// Owner noch Admin ist.
 type OrgNotFoundError struct{ Key string }
 
 func (e *OrgNotFoundError) Error() string {
 	return fmt.Sprintf("organization %q not found, or the API account is neither owner nor admin there", e.Key)
 }
 
-// OrgExistsError means an organization with that name is already managed by the API account.
+// OrgExistsError bedeutet, dass das API-Konto bereits eine Organisation mit diesem Namen verwaltet.
 type OrgExistsError struct{ Name string }
 
 func (e *OrgExistsError) Error() string {
@@ -44,14 +46,14 @@ type Service struct{ dir Directory }
 
 func NewService(dir Directory) *Service { return &Service{dir: dir} }
 
-// ChangeResult is the outcome of one executed change.
+// ChangeResult ist das Ergebnis einer ausgeführten Änderung.
 type ChangeResult struct {
 	Change
 	OK    bool   `json:"ok"`
 	Error string `json:"error,omitempty"`
 }
 
-// Plan reads the actual state and plans every organization of the desired state. It writes nothing.
+// Plan liest den Ist-Zustand und plant jede Organisation aus dem Soll. Es wird nichts geschrieben.
 func (s *Service) Plan(ctx context.Context, desired Desired, allowRemoval bool) ([]OrgPlan, error) {
 	profile, err := s.dir.Profile(ctx)
 	if err != nil {
@@ -73,8 +75,9 @@ func (s *Service) Plan(ctx context.Context, desired Desired, allowRemoval bool) 
 	return plans, nil
 }
 
-// Apply executes one org plan. A failed change does not stop the rest: partial success beats aborting
-// mid-run, and running again picks up what is left because planning is idempotent.
+// Apply führt den Plan einer Org aus. Eine fehlgeschlagene Änderung stoppt die übrigen nicht. Ein
+// Teilerfolg ist besser als ein Abbruch mitten im Lauf, und ein erneuter Lauf holt den Rest nach,
+// weil die Planung idempotent ist.
 func (s *Service) Apply(ctx context.Context, plan OrgPlan) []ChangeResult {
 	results := make([]ChangeResult, 0, len(plan.Changes))
 	for _, c := range plan.Changes {
@@ -99,38 +102,54 @@ func (s *Service) execute(ctx context.Context, orgID string, c Change) error {
 	return fmt.Errorf("unknown change type %q", c.Type)
 }
 
-// PendingConfirm lists the members of one org waiting for confirmation (status "accepted").
-// only is an allowlist of lower-case e-mails; nil means everyone.
-func (s *Service) PendingConfirm(ctx context.Context, org model.Organization, only map[string]bool) ([]model.Member, error) {
+// Candidates teilt die Mitglieder einer Org, die zur Auswahl passen (nil bedeutet alle), in solche, die
+// sich jetzt bestätigen lassen, und solche, bei denen das noch nicht geht.
+//
+// Pending sind Mitglieder mit Status "accepted". Sie haben sich registriert und besitzen deshalb ein
+// Schlüsselpaar. Waiting sind Mitglieder mit Status "invited". Ohne Mailversand sind das eingeladene
+// Personen, die sich noch nicht registriert haben. Für sie gibt es noch keinen öffentlichen Schlüssel,
+// mit dem sich der Organisations-Schlüssel verschlüsseln ließe. Sobald sie sich registrieren, wechseln
+// sie von selbst auf "accepted", und ein späterer confirm-Aufruf bestätigt sie.
+func (s *Service) Candidates(ctx context.Context, org model.Organization, only map[string]bool) (pending []model.Member, waiting []string, err error) {
 	members, err := s.dir.OrgUsers(ctx, org.ID)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	var pending []model.Member
 	for _, m := range members {
-		if m.Status == model.Accepted && (only == nil || only[m.Email]) {
+		if only != nil && !only[m.Email] {
+			continue
+		}
+		switch m.Status {
+		case model.Accepted:
 			pending = append(pending, m)
+		case model.Invited:
+			waiting = append(waiting, m.Email)
 		}
 	}
-	return pending, nil
+	return pending, waiting, nil
 }
 
-// ConfirmResult is the outcome for one member.
+// ConfirmResult ist das Ergebnis für ein Mitglied.
 type ConfirmResult struct {
 	Email string `json:"email"`
 	OK    bool   `json:"ok"`
 	Error string `json:"error,omitempty"`
 }
 
-// OrgConfirm is the confirm outcome for one org. Results is empty on a dry run.
+// OrgConfirm ist das Ergebnis von confirm für eine Org. Results ist bei einer Vorschau leer.
 type OrgConfirm struct {
-	Org     model.Organization `json:"org"`
-	Pending []string           `json:"pending"`
-	Results []ConfirmResult    `json:"results,omitempty"`
+	Org model.Organization `json:"org"`
+	// Pending sind die Mitglieder, die sich jetzt bestätigen lassen.
+	Pending []string `json:"pending"`
+	// Waiting sind passende Mitglieder, die sich noch nicht registriert haben. Ein späterer Aufruf
+	// bestätigt sie.
+	Waiting []string        `json:"waiting"`
+	Results []ConfirmResult `json:"results,omitempty"`
 }
 
-// ConfirmAll confirms accepted members in every admin org. keys is called at most once, and only when
-// something is really confirmed. On a dry run it is never called and no master password is needed.
+// ConfirmAll bestätigt registrierte Mitglieder in jeder verwalteten Org und meldet die, deren
+// Registrierung noch aussteht. keys wird höchstens einmal aufgerufen, und nur wenn wirklich jemand
+// bestätigt wird. Bei einer Vorschau wird es nie aufgerufen, und es ist kein Master-Passwort nötig.
 func (s *Service) ConfirmAll(ctx context.Context, only map[string]bool, apply bool, keys func(context.Context) (OrgKeys, error)) ([]OrgConfirm, error) {
 	orgs, err := s.dir.AdminOrganizations(ctx)
 	if err != nil {
@@ -139,18 +158,18 @@ func (s *Service) ConfirmAll(ctx context.Context, only map[string]bool, apply bo
 	out := []OrgConfirm{}
 	var vault OrgKeys
 	for _, org := range orgs {
-		pending, err := s.PendingConfirm(ctx, org, only)
+		pending, waiting, err := s.Candidates(ctx, org, only)
 		if err != nil {
 			return nil, err
 		}
-		if len(pending) == 0 {
+		if len(pending) == 0 && len(waiting) == 0 {
 			continue
 		}
-		oc := OrgConfirm{Org: org, Pending: make([]string, len(pending))}
+		oc := OrgConfirm{Org: org, Pending: make([]string, len(pending)), Waiting: orEmptyStrings(waiting)}
 		for i, m := range pending {
 			oc.Pending[i] = m.Email
 		}
-		if apply {
+		if apply && len(pending) > 0 {
 			if vault == nil {
 				if vault, err = keys(ctx); err != nil {
 					return nil, err
@@ -181,10 +200,10 @@ func (s *Service) confirm(ctx context.Context, org model.Organization, members [
 	return results
 }
 
-// CreateOrg creates an organization. Vaultwarden does not enforce unique names, so a second call would
-// silently create a duplicate; the name is checked first, case-insensitively, among the orgs the API
-// account administers. Orgs the account cannot see are not visible to this check.
-// With apply=false nothing is created and the returned org has no ID.
+// CreateOrg legt eine Organisation an. Vaultwarden erzwingt keine eindeutigen Namen, ein zweiter Aufruf
+// würde also still ein Duplikat anlegen. Deshalb wird der Name vorher ohne Beachtung der Groß- und
+// Kleinschreibung unter den Orgs geprüft, die das API-Konto verwaltet. Orgs, die das Konto nicht sieht,
+// erfasst diese Prüfung nicht. Ist apply false, wird nichts angelegt, und die gelieferte Org hat keine ID.
 func (s *Service) CreateOrg(ctx context.Context, name, billingEmail string, apply bool) (model.Organization, error) {
 	orgs, err := s.dir.AdminOrganizations(ctx)
 	if err != nil {
@@ -204,4 +223,11 @@ func (s *Service) CreateOrg(ctx context.Context, name, billingEmail string, appl
 		}
 	}
 	return s.dir.CreateOrganization(ctx, name, billingEmail)
+}
+
+func orEmptyStrings(l []string) []string {
+	if l == nil {
+		return []string{}
+	}
+	return l
 }

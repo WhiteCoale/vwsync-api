@@ -13,7 +13,8 @@ import (
 	"vwsync-api/internal/crypto"
 )
 
-// unlockedClient returns a client whose fake server hands out login data for a known master password.
+// unlockedClient liefert einen Client, dessen Testserver Login-Daten zu einem bekannten Master-Passwort
+// ausgibt.
 func unlockedClient(t *testing.T) (*Client, *fakeVW, *rsa.PrivateKey) {
 	t.Helper()
 	const pw, email = "pw-for-test", "admin@x.io"
@@ -69,7 +70,7 @@ func TestCreateOrganizationSendsKeysOnlyTheOwnerCanOpen(t *testing.T) {
 	if strings.Contains(post.body, string(orgKey)) {
 		t.Fatal("organization key sent in the clear")
 	}
-	// The returned org is immediately usable for confirm.
+	// Die gelieferte Org ist sofort für confirm nutzbar.
 	if got, err := crypto.DecryptAsymmetric(org.EncryptedKey, owner); err != nil || string(got) != string(orgKey) {
 		t.Fatalf("returned org carries the wrong key: %v", err)
 	}
@@ -77,10 +78,10 @@ func TestCreateOrganizationSendsKeysOnlyTheOwnerCanOpen(t *testing.T) {
 
 func TestCreateOrganizationNeedsMasterPasswordAndSurfacesServerRefusal(t *testing.T) {
 	c, _ := newFake(t, good)
-	if _, err := c.CreateOrganization(context.Background(), "X", "a@b.c"); err != ErrNoMasterPassword {
+	if _, err := c.CreateOrganization(context.Background(), "X", "a@b.c"); !errors.Is(err, ErrNoMasterPassword) {
 		t.Fatalf("%v", err)
 	}
-	c, _, _ = unlockedClient(t) // no POST handler: the fake answers 404
+	c, _, _ = unlockedClient(t) // kein POST-Handler, der Testserver antwortet mit 404
 	var ae *APIError
 	if _, err := c.CreateOrganization(context.Background(), "X", "a@b.c"); !errors.As(err, &ae) {
 		t.Fatalf("%v", err)

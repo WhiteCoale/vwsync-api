@@ -1,14 +1,16 @@
 //go:build e2e
 
-// Package e2e runs the compiled service against a real, throwaway Vaultwarden.
+// Package e2e testet das gebaute Binary gegen ein echtes Vaultwarden zum Wegwerfen.
 //
 //	docker run -d --rm --name vwsync-e2e -p 127.0.0.1:18082:80 \
-//	  -e DOMAIN=http://127.0.0.1:18082 -e I_REALLY_WANT_VOLATILE_STORAGE=true vaultwarden/server:latest
+//	  -e DOMAIN=http://127.0.0.1:18082 -e I_REALLY_WANT_VOLATILE_STORAGE=true \
+//	  -e LOGIN_RATELIMIT_MAX_BURST=1000 -e LOGIN_RATELIMIT_SECONDS=1 vaultwarden/server:latest
 //	VW_E2E_URL=http://127.0.0.1:18082 go test -tags e2e -count=1 -v ./e2e
 //
-// The test registers its own accounts with random passwords. Where the Bitwarden CLI (bw) is installed
-// it is used as an independent client: if bw can log in and read what this service wrote, the
-// encryption formats are right. bw runs with its own data directory and never touches the user's.
+// Der Test registriert eigene Konten mit zufälligen Passwörtern. Ist die Bitwarden-CLI (bw)
+// installiert, dient sie als unabhängiger Client. Kann bw sich anmelden und lesen, was der Dienst
+// geschrieben hat, stimmen die Verschlüsselungsformate. bw läuft mit eigenem Datenverzeichnis und
+// fasst die Konfiguration des Benutzers nie an.
 package e2e
 
 import (
@@ -44,13 +46,16 @@ import (
 
 var vwURL = os.Getenv("VW_E2E_URL")
 
-// --- Vaultwarden accounts -----------------------------------------------------------------------
+// --- Vaultwarden-Konten -------------------------------------------------------------------------
 
 type account struct {
 	email, password string
 	kdf             crypto.KDFParams
 	userKey         []byte
 	priv            *rsa.PrivateKey
+
+	// Schlüsselmaterial, das bei der Registrierung an den Server geht.
+	encUserKey, publicKey, encPrivateKey string
 }
 
 func randHex(n int) string {
@@ -68,7 +73,7 @@ func (a account) masterKey(t *testing.T) []byte {
 	return mk
 }
 
-// authHash is what the server stores instead of the password: PBKDF2(masterKey, password, 1 round).
+// authHash speichert der Server statt des Passworts: PBKDF2(masterKey, password, 1 Runde).
 func (a account) authHash(t *testing.T) string {
 	t.Helper()
 	h, err := pbkdf2.Key(sha256.New, string(a.masterKey(t)), []byte(a.password), 1, 32)
@@ -98,12 +103,14 @@ func do(t *testing.T, req *http.Request) (int, []byte) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	b, _ := io.ReadAll(resp.Body)
 	return resp.StatusCode, b
 }
 
-func register(t *testing.T, kdf crypto.KDFParams) account {
+// newAccount erzeugt die Schlüssel eines Kontos, ohne dem Server etwas mitzuteilen. Ein Konto, das nur
+// so existiert, steht für eine Person, die sich noch nicht registriert hat.
+func newAccount(t *testing.T, kdf crypto.KDFParams) account {
 	t.Helper()
 	a := account{email: "u" + randHex(4) + "@example.test", password: randHex(16), kdf: kdf}
 	stretched, err := crypto.StretchMasterKey(a.masterKey(t))
@@ -112,12 +119,18 @@ func register(t *testing.T, kdf crypto.KDFParams) account {
 	}
 	a.userKey = make([]byte, 64)
 	_, _ = rand.Read(a.userKey)
-	encUserKey, _ := crypto.EncryptSymmetric(a.userKey, stretched)
+	a.encUserKey, _ = crypto.EncryptSymmetric(a.userKey, stretched)
 	a.priv, _ = rsa.GenerateKey(rand.Reader, 2048)
 	der, _ := x509.MarshalPKCS8PrivateKey(a.priv)
 	pub, _ := x509.MarshalPKIXPublicKey(&a.priv.PublicKey)
-	encPriv, _ := crypto.EncryptSymmetric(der, a.userKey)
+	a.publicKey = base64.StdEncoding.EncodeToString(pub)
+	a.encPrivateKey, _ = crypto.EncryptSymmetric(der, a.userKey)
+	return a
+}
 
+// signUp registriert das Konto auf dem Server, so wie eine Person es im Web-Vault tut.
+func (a account) signUp(t *testing.T) {
+	t.Helper()
 	code, body := postJSON(t, "/identity/accounts/register/send-verification-email",
 		"", map[string]any{"email": a.email, "name": "e2e", "receiveMarketingEmails": false}, "application/json")
 	if code != 200 {
@@ -130,24 +143,27 @@ func register(t *testing.T, kdf crypto.KDFParams) account {
 		"email":                  a.email,
 		"emailVerificationToken": token,
 		"masterPasswordHash":     a.authHash(t),
-		"key":                    encUserKey,
-		"kdf":                    kdf.Type,
-		"kdfIterations":          kdf.Iterations,
-		"keys": map[string]string{
-			"publicKey":           base64.StdEncoding.EncodeToString(pub),
-			"encryptedPrivateKey": encPriv,
-		},
+		"key":                    a.encUserKey,
+		"kdf":                    a.kdf.Type,
+		"kdfIterations":          a.kdf.Iterations,
+		"keys":                   map[string]string{"publicKey": a.publicKey, "encryptedPrivateKey": a.encPrivateKey},
 	}
-	if kdf.Type == crypto.KDFArgon2id {
-		reg["kdfMemory"], reg["kdfParallelism"] = kdf.MemoryMiB, kdf.Parallelism
+	if a.kdf.Type == crypto.KDFArgon2id {
+		reg["kdfMemory"], reg["kdfParallelism"] = a.kdf.MemoryMiB, a.kdf.Parallelism
 	}
 	if code, body := postJSON(t, "/identity/accounts/register/finish", "", reg, ""); code != 200 {
 		t.Fatalf("register/finish: %d %s", code, body)
 	}
+}
+
+func register(t *testing.T, kdf crypto.KDFParams) account {
+	t.Helper()
+	a := newAccount(t, kdf)
+	a.signUp(t)
 	return a
 }
 
-// passwordToken logs in like a web client and returns an access token.
+// passwordToken meldet sich wie ein Web-Client an und liefert ein Access-Token.
 func (a account) passwordToken(t *testing.T) string {
 	t.Helper()
 	form := url.Values{
@@ -181,7 +197,7 @@ func (a account) get(t *testing.T, token, path string, out any) {
 	}
 }
 
-// apiKey returns the personal API key (client_id, client_secret) of the account.
+// apiKey liefert den persönlichen API-Key (client_id, client_secret) des Kontos.
 func (a account) apiKey(t *testing.T) (string, string) {
 	t.Helper()
 	tok := a.passwordToken(t)
@@ -196,7 +212,7 @@ func (a account) apiKey(t *testing.T) (string, string) {
 	return "user." + profile.ID, r.ApiKey
 }
 
-// serverVersion returns major and minor of the Vaultwarden under test (not the Bitwarden API version).
+// serverVersion liefert Haupt- und Nebenversion des getesteten Vaultwarden (nicht der Bitwarden-API).
 func serverVersion(t *testing.T) [2]int {
 	t.Helper()
 	req, _ := http.NewRequest("GET", vwURL+"/api/version", nil)
@@ -212,7 +228,7 @@ func serverVersion(t *testing.T) [2]int {
 	return v
 }
 
-// --- bw (independent client) --------------------------------------------------------------------
+// --- bw (unabhängiger Client) -------------------------------------------------------------------
 
 type bw struct {
 	t   *testing.T
@@ -220,8 +236,8 @@ type bw struct {
 	env []string
 }
 
-// tlsProxy puts a self-signed HTTPS front on the throwaway Vaultwarden, because bw refuses http://.
-// It returns the https URL and the path of the certificate bw has to trust.
+// tlsProxy setzt einen HTTPS-Zugang mit selbstsigniertem Zertifikat vor das Test-Vaultwarden, weil bw
+// http:// ablehnt. Geliefert werden die HTTPS-URL und der Pfad des Zertifikats, dem bw vertrauen muss.
 func tlsProxy(t *testing.T) (string, string) {
 	t.Helper()
 	target, _ := url.Parse(vwURL)
@@ -255,7 +271,8 @@ func (b *bw) run(extraEnv []string, args ...string) ([]byte, error) {
 	return cmd.CombinedOutput()
 }
 
-// login returns a session key. The password goes through an environment variable, never the command line.
+// login liefert einen Sitzungsschlüssel. Das Passwort läuft über eine Umgebungsvariable, nie über
+// die Kommandozeile.
 func (b *bw) login(a account) string {
 	b.t.Helper()
 	out, err := b.run([]string{"BW_PASSWORD=" + a.password}, "login", a.email, "--passwordenv", "BW_PASSWORD", "--raw")
@@ -280,7 +297,7 @@ func scrub(b []byte, a account) string {
 	return strings.ReplaceAll(string(b), a.password, "<password>")
 }
 
-// --- the service under test ---------------------------------------------------------------------
+// --- der getestete Dienst -----------------------------------------------------------------------
 
 type svc struct {
 	t     *testing.T
@@ -301,12 +318,23 @@ func startService(t *testing.T, admin account) *svc {
 		t.Fatalf("build: %v\n%s", err, out)
 	}
 
-	svcPassword := randHex(12)
-	hashCmd := exec.Command(bin, "hash-password")
-	hashCmd.Stdin = strings.NewReader(svcPassword + "\n")
-	hash, err := hashCmd.Output()
+	// Der Schlüssel entsteht so, wie ein Betreiber ihn erzeugt, mit dem Befehl generate-key.
+	out, err := exec.Command(bin, "generate-key").Output()
 	if err != nil {
-		t.Fatalf("hash-password: %v", err)
+		t.Fatalf("generate-key: %v", err)
+	}
+	var apiKey, keyHash string
+	for _, line := range strings.Split(string(out), "\n") {
+		line = strings.TrimSpace(line)
+		switch {
+		case strings.HasPrefix(line, "vwsk_"):
+			apiKey = line
+		case strings.HasPrefix(line, "VWSYNC_API_KEY_HASH="):
+			keyHash = strings.TrimPrefix(line, "VWSYNC_API_KEY_HASH=")
+		}
+	}
+	if apiKey == "" || keyHash == "" {
+		t.Fatalf("generate-key printed no key or no hash:\n%s", out)
 	}
 
 	clientID, secret := admin.apiKey(t)
@@ -316,8 +344,7 @@ func startService(t *testing.T, admin account) *svc {
 
 	cmd := exec.Command(bin, "serve")
 	cmd.Env = append(os.Environ(),
-		"VWSYNC_LISTEN="+addr, "VWSYNC_USER=sync", "VWSYNC_PASSWORD_HASH="+strings.TrimSpace(string(hash)),
-		"VWSYNC_JWT_SECRET="+randHex(24), "VW_URL="+vwURL, "VW_CLIENT_ID="+clientID, "VW_CLIENT_SECRET="+secret,
+		"VWSYNC_LISTEN="+addr, "VWSYNC_API_KEY_HASH="+keyHash, "VW_URL="+vwURL, "VW_CLIENT_ID="+clientID, "VW_CLIENT_SECRET="+secret,
 		"VW_MASTER_PASSWORD="+admin.password)
 	var logs bytes.Buffer
 	cmd.Stderr = &logs
@@ -332,10 +359,10 @@ func startService(t *testing.T, admin account) *svc {
 		}
 	})
 
-	s := &svc{t: t, base: "http://" + addr}
+	s := &svc{t: t, base: "http://" + addr, token: apiKey}
 	for i := 0; ; i++ {
 		if resp, err := http.Get(s.base + "/healthz"); err == nil {
-			resp.Body.Close()
+			_ = resp.Body.Close()
 			break
 		}
 		if i > 100 {
@@ -344,11 +371,6 @@ func startService(t *testing.T, admin account) *svc {
 		time.Sleep(100 * time.Millisecond)
 	}
 
-	code, body := s.call("POST", "/v1/auth/login", map[string]string{"username": "sync", "password": svcPassword})
-	if code != 200 {
-		t.Fatalf("service login: %d %v", code, body)
-	}
-	s.token = body["access_token"].(string)
 	return s
 }
 
@@ -384,7 +406,7 @@ func desired(org string, members map[string]string) map[string]any {
 	return map[string]any{"orgs": map[string]any{org: map[string]any{"members": members}}}
 }
 
-// --- the test -----------------------------------------------------------------------------------
+// --- der Test -----------------------------------------------------------------------------------
 
 func TestEndToEnd(t *testing.T) {
 	if vwURL == "" {
@@ -401,8 +423,12 @@ func TestEndToEnd(t *testing.T) {
 		if code, _ := anon.call("GET", "/v1/orgs", nil); code != 401 {
 			t.Fatalf("no token: %d", code)
 		}
-		if code, _ := anon.call("POST", "/v1/auth/login", map[string]string{"username": "sync", "password": "wrong"}); code != 401 {
-			t.Fatalf("wrong password: %d", code)
+		wrong := &svc{t: t, base: s.base, token: "vwsk_" + strings.Repeat("A", 43)}
+		if code, _ := wrong.call("GET", "/v1/orgs", nil); code != 401 {
+			t.Fatalf("wrong key: %d", code)
+		}
+		if code, _ := s.call("GET", "/v1/orgs", nil); code != 200 {
+			t.Fatalf("the generated key: %d", code)
 		}
 	})
 
@@ -415,19 +441,19 @@ func TestEndToEnd(t *testing.T) {
 
 	var orgID string
 	t.Run("create org", func(t *testing.T) {
-		out := s.expect(200, "POST", "/v1/orgs", map[string]string{"name": orgName})
+		out := s.expect(200, "POST", "/v1/orgs?dry_run=true", map[string]string{"name": orgName})
 		if out["dry_run"] != true {
 			t.Fatalf("dry run is not the default: %v", out)
 		}
 		if len(s.expect(200, "GET", "/v1/orgs", nil)["orgs"].([]any)) != 0 {
 			t.Fatal("dry run created an org")
 		}
-		out = s.expect(201, "POST", "/v1/orgs?apply=true", map[string]string{"name": orgName})
+		out = s.expect(201, "POST", "/v1/orgs", map[string]string{"name": orgName})
 		orgID = out["org"].(map[string]any)["id"].(string)
 		if orgID == "" {
 			t.Fatalf("%v", out)
 		}
-		s.expect(409, "POST", "/v1/orgs?apply=true", map[string]string{"name": "e2e team"})
+		s.expect(409, "POST", "/v1/orgs", map[string]string{"name": "e2e team"})
 		if got := s.expect(200, "GET", "/v1/orgs", nil)["orgs"].([]any); len(got) != 1 {
 			t.Fatalf("expected exactly one org, got %v", got)
 		}
@@ -477,14 +503,15 @@ func TestEndToEnd(t *testing.T) {
 		}
 	})
 
-	t.Run("sync: dry run, apply, idempotent", func(t *testing.T) {
+	t.Run("sync: preview, execute, idempotent", func(t *testing.T) {
 		want := desired(orgName, map[string]string{member.email: "user"})
-		out := s.expect(200, "POST", "/v1/sync", want)
+		out := s.expect(200, "POST", "/v1/sync?dry_run=true", want)
 		if !strings.Contains(fmt.Sprint(out), "invite") {
 			t.Fatalf("plan has no invite: %v", out)
 		}
-		s.expect(200, "POST", "/v1/sync?apply=true", want)
-		again := s.expect(200, "POST", "/v1/sync", want)
+		s.expect(200, "POST", "/v1/sync", want)
+		s.expect(400, "POST", "/v1/sync?apply=false", want) // der Parameter apply wird abgelehnt, nicht ignoriert
+		again := s.expect(200, "POST", "/v1/sync?dry_run=true", want)
 		if len(again["plans"].([]any)[0].(map[string]any)["changes"].([]any)) != 0 {
 			t.Fatalf("second plan is not empty: %v", again)
 		}
@@ -508,12 +535,12 @@ func TestEndToEnd(t *testing.T) {
 		if memberStatus != "accepted" {
 			t.Skipf("member is %q, not accepted: the server needs the invite mail link to accept", memberStatus)
 		}
-		s.expect(400, "POST", "/v1/confirm?apply=true", nil)
-		dry := s.expect(200, "POST", "/v1/confirm", map[string][]string{"emails": {member.email}})
+		s.expect(400, "POST", "/v1/confirm", nil)
+		dry := s.expect(200, "POST", "/v1/confirm?dry_run=true", map[string][]string{"emails": {member.email}})
 		if !strings.Contains(fmt.Sprint(dry), member.email) {
 			t.Fatalf("%v", dry)
 		}
-		out := s.expect(200, "POST", "/v1/confirm?apply=true", map[string][]string{"emails": {member.email}})
+		out := s.expect(200, "POST", "/v1/confirm", map[string][]string{"emails": {member.email}})
 		if out["failures"] != float64(0) {
 			t.Fatalf("%v", out)
 		}
@@ -524,7 +551,8 @@ func TestEndToEnd(t *testing.T) {
 			}
 		}
 
-		// The member can open the organization key with their own private key, and it is the owner's key.
+		// Das Mitglied kann den Organisations-Schlüssel mit seinem privaten Schlüssel öffnen, und es ist
+		// derselbe wie der des Owners.
 		ownerTok, memberTok := admin.passwordToken(t), member.passwordToken(t)
 		type syncResp struct {
 			Profile struct{ Organizations []struct{ Key string } }
@@ -563,7 +591,7 @@ func TestEndToEnd(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		// createCollection returns the HTTP status the server gives the member for creating a collection.
+		// createCollection liefert den HTTP-Status, den das Mitglied beim Anlegen einer Sammlung erhält.
 		createCollection := func() (int, string) {
 			name, _ := crypto.EncryptSymmetric([]byte("made by "+randHex(3)), orgKey)
 			code, body := postJSON(t, "/api/organizations/"+orgID+"/collections", memberTok,
@@ -573,11 +601,11 @@ func TestEndToEnd(t *testing.T) {
 			return code, r.ID
 		}
 		setRole := func(role string) {
-			s.expect(200, "POST", "/v1/sync?apply=true&no_remove=true", desired(orgName, map[string]string{member.email: role}))
+			s.expect(200, "POST", "/v1/sync?no_remove=true", desired(orgName, map[string]string{member.email: role}))
 			if got := roleOf(); got != role {
 				t.Fatalf("after setting %s the listing says %s", role, got)
 			}
-			again := s.expect(200, "POST", "/v1/sync?no_remove=true", desired(orgName, map[string]string{member.email: role}))
+			again := s.expect(200, "POST", "/v1/sync?dry_run=true&no_remove=true", desired(orgName, map[string]string{member.email: role}))
 			if len(again["plans"].([]any)[0].(map[string]any)["changes"].([]any)) != 0 {
 				t.Fatalf("%s is not idempotent: %v", role, again)
 			}
@@ -594,8 +622,8 @@ func TestEndToEnd(t *testing.T) {
 			t.Fatalf("custom member cannot delete the collection: %d %s", code, body)
 		}
 
-		// Vaultwarden 1.35 still lets a manager without manage-all create collections. The check that
-		// stops it is in 1.37, so the manager denial is only asserted from there on.
+		// Vaultwarden 1.35 lässt einen Manager ohne "Alle Sammlungen verwalten" noch Sammlungen anlegen.
+		// Die Sperre kam mit 1.37, deshalb wird die Ablehnung erst ab dieser Version geprüft.
 		ver := serverVersion(t)
 		for _, role := range []string{"manager", "user"} {
 			setRole(role)
@@ -608,14 +636,14 @@ func TestEndToEnd(t *testing.T) {
 				t.Fatalf("a %s must not create collections", role)
 			}
 		}
-		setRole("custom") // and back: the permissions are re-applied, not sticky
+		setRole("custom") // und zurück, die Berechtigungen werden neu gesetzt und bleiben nicht hängen
 		if code, _ := createCollection(); code != 200 {
 			t.Fatalf("custom after manager/user: %d", code)
 		}
 	})
 
 	t.Run("role change and removal", func(t *testing.T) {
-		s.expect(200, "POST", "/v1/sync?apply=true", desired(orgName, map[string]string{member.email: "manager"}))
+		s.expect(200, "POST", "/v1/sync", desired(orgName, map[string]string{member.email: "manager"}))
 		role := func() string {
 			for _, m := range s.expect(200, "GET", "/v1/orgs/"+orgName+"/members", nil)["members"].([]any) {
 				if m := m.(map[string]any); m["email"] == member.email {
@@ -627,16 +655,16 @@ func TestEndToEnd(t *testing.T) {
 		if role() != "manager" {
 			t.Fatalf("role is %s", role())
 		}
-		// Removal limit: a request that removes more than allowed changes nothing.
-		s.expect(422, "POST", "/v1/sync?apply=true&max_removals=0", desired(orgName, map[string]string{}))
+		// Obergrenze für Entfernungen. Ein Request, der mehr als erlaubt entfernen würde, ändert nichts.
+		s.expect(422, "POST", "/v1/sync?max_removals=0", desired(orgName, map[string]string{}))
 		if role() != "manager" {
 			t.Fatal("removal limit did not protect the member")
 		}
-		s.expect(200, "POST", "/v1/sync?apply=true", desired(orgName, map[string]string{}))
+		s.expect(200, "POST", "/v1/sync", desired(orgName, map[string]string{}))
 		if role() != "gone" {
 			t.Fatalf("member still there: %s", role())
 		}
-		// The API account itself is never removed.
+		// Das API-Konto selbst wird nie entfernt.
 		if got := s.expect(200, "GET", "/v1/orgs/"+orgName+"/members", nil)["members"].([]any); len(got) != 1 {
 			t.Fatalf("expected only the owner, got %v", got)
 		}
@@ -646,9 +674,9 @@ func TestEndToEnd(t *testing.T) {
 		if memberStatus != "accepted" {
 			t.Skip("member was not confirmed")
 		}
-		// The member was removed in the previous step. Invite, confirm and then revoke them.
-		s.expect(200, "POST", "/v1/sync?apply=true", desired(orgName, map[string]string{member.email: "user"}))
-		s.expect(200, "POST", "/v1/confirm?apply=true", map[string][]string{"emails": {member.email}})
+		// Das Mitglied wurde im vorigen Schritt entfernt. Einladen, bestätigen, dann sperren.
+		s.expect(200, "POST", "/v1/sync", desired(orgName, map[string]string{member.email: "user"}))
+		s.expect(200, "POST", "/v1/confirm", map[string][]string{"emails": {member.email}})
 
 		var memberID string
 		for _, m := range s.expect(200, "GET", "/v1/orgs/"+orgName+"/members", nil)["members"].([]any) {
@@ -676,8 +704,8 @@ func TestEndToEnd(t *testing.T) {
 			t.Fatalf("expected revoked, got %s", got)
 		}
 
-		// An empty desired state would remove every member, but not one that an admin only suspended.
-		out := s.expect(200, "POST", "/v1/sync?apply=true", desired(orgName, map[string]string{}))
+		// Ein leerer Soll-Zustand entfernt alle Mitglieder, aber keines, das ein Admin nur gesperrt hat.
+		out := s.expect(200, "POST", "/v1/sync", desired(orgName, map[string]string{}))
 		if got := statusOf(); got != "revoked" {
 			t.Fatalf("a sync removed the revoked member: %s", got)
 		}
@@ -685,19 +713,74 @@ func TestEndToEnd(t *testing.T) {
 			t.Fatalf("the skipped member is not reported: %v", out)
 		}
 
-		// The exported state leaves revoked members out, and syncing it back must not remove them.
+		// Der Export lässt gesperrte Mitglieder weg, und das Zurückschicken darf sie nicht entfernen.
 		exp := s.expect(200, "GET", "/v1/export", nil)
 		if strings.Contains(fmt.Sprint(exp["desired"]), member.email) {
 			t.Fatalf("revoked member in the exported desired state: %v", exp["desired"])
 		}
-		s.expect(200, "POST", "/v1/sync?apply=true", exp["desired"])
+		s.expect(200, "POST", "/v1/sync", exp["desired"])
 		if got := statusOf(); got != "revoked" {
 			t.Fatalf("syncing the export removed the revoked member: %s", got)
 		}
 
-		// Org names match without regard to letter case.
+		// Org-Namen passen ohne Beachtung der Groß- und Kleinschreibung.
 		s.expect(200, "GET", "/v1/orgs/"+url.PathEscape(strings.ToLower(orgName))+"/members", nil)
-		s.expect(200, "POST", "/v1/sync", desired(strings.ToUpper(orgName), map[string]string{}))
+		s.expect(200, "POST", "/v1/sync?dry_run=true", desired(strings.ToUpper(orgName), map[string]string{}))
+	})
+
+	t.Run("a member invited before registering is confirmed after registering", func(t *testing.T) {
+		// Ohne Mailversand nimmt niemand eine Einladung an. Wer sich noch nicht registriert hat, bleibt
+		// "invited" und hat keine Schlüssel, confirm kann also für niemanden verschlüsseln. Die Registrierung
+		// macht aus der Einladung "accepted", und der nächste confirm-Aufruf erledigt den Rest.
+		late := newAccount(t, pbkdf2Params)
+		statusOf := func() string {
+			for _, m := range s.expect(200, "GET", "/v1/orgs/"+orgName+"/members", nil)["members"].([]any) {
+				if m := m.(map[string]any); m["email"] == late.email {
+					return m["status"].(string)
+				}
+			}
+			return "gone"
+		}
+		confirmBody := map[string][]string{"emails": {late.email}}
+		listed := func(out map[string]any, field string) bool {
+			orgs := out["orgs"].([]any)
+			return len(orgs) == 1 && strings.Contains(fmt.Sprint(orgs[0].(map[string]any)[field]), late.email)
+		}
+
+		s.expect(200, "POST", "/v1/sync?no_remove=true", desired(orgName, map[string]string{late.email: "user"}))
+		if got := statusOf(); got != "invited" {
+			t.Fatalf("an unregistered person must stay invited, got %s", got)
+		}
+
+		out := s.expect(200, "POST", "/v1/confirm?dry_run=true", confirmBody)
+		if !listed(out, "waiting") || listed(out, "pending") {
+			t.Fatalf("an unregistered person must be reported as waiting, not pending: %v", out)
+		}
+		out = s.expect(200, "POST", "/v1/confirm", confirmBody)
+		if out["failures"] != float64(0) || statusOf() != "invited" {
+			t.Fatalf("confirming before registration must change nothing and fail nowhere: %v", out)
+		}
+
+		late.signUp(t)
+		if got := statusOf(); got != "accepted" {
+			t.Fatalf("registering must turn the invitation into accepted, got %s", got)
+		}
+		out = s.expect(200, "POST", "/v1/confirm", confirmBody)
+		if out["failures"] != float64(0) || statusOf() != "confirmed" {
+			t.Fatalf("%v", out)
+		}
+
+		// Das neue Mitglied besitzt den Organisations-Schlüssel.
+		var ownerSync, lateSync struct {
+			Profile struct{ Organizations []struct{ Key string } }
+		}
+		admin.get(t, admin.passwordToken(t), "/api/sync", &ownerSync)
+		late.get(t, late.passwordToken(t), "/api/sync", &lateSync)
+		ownerKey, _ := crypto.DecryptAsymmetric(ownerSync.Profile.Organizations[0].Key, admin.priv)
+		lateKey, err := crypto.DecryptAsymmetric(lateSync.Profile.Organizations[0].Key, late.priv)
+		if err != nil || !bytes.Equal(ownerKey, lateKey) {
+			t.Fatalf("the member invited first got a wrong key: %v", err)
+		}
 	})
 
 	t.Run("argon2id account works with a real client and as API account", func(t *testing.T) {
@@ -706,7 +789,8 @@ func TestEndToEnd(t *testing.T) {
 			t.Skip("bw not installed")
 		}
 		argon := register(t, crypto.KDFParams{Type: crypto.KDFArgon2id, Iterations: 3, MemoryMiB: 64, Parallelism: 4})
-		// bw derives the key with its own Argon2id implementation. If ours differed, this login would fail.
+		// bw leitet den Schlüssel mit einer eigenen Argon2id-Implementierung ab. Wiche unsere ab, schlüge
+		// dieser Login fehl.
 		b.login(argon)
 
 		cid, secret := argon.apiKey(t)

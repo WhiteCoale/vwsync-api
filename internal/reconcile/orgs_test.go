@@ -21,7 +21,7 @@ func TestFindOrg(t *testing.T) {
 		"beta":       "id-2",
 		"team alpha": "id-1",
 		"TEAM ALPHA": "id-1",
-		"twin":       "id-3", // two orgs match without regard to case, the exact spelling wins
+		"twin":       "id-3", // zwei Orgs passen ohne Beachtung der Schreibweise, die exakte gewinnt
 		"TWIN":       "id-4",
 	}
 	for key, want := range found {
@@ -56,7 +56,7 @@ func TestPlanLeavesRevokedMembersAloneWhenTheyAreNotDesired(t *testing.T) {
 	}
 }
 
-// profileDir counts how often the profile is fetched.
+// profileDir zählt, wie oft das Profil abgerufen wird.
 type profileDir struct {
 	Directory
 	profiles int

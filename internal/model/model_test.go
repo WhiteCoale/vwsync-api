@@ -12,9 +12,9 @@ func TestRoleFromAPI(t *testing.T) {
 		want      Role
 	}{
 		{0, false, Owner}, {1, false, Admin}, {2, false, User},
-		{3, false, Manager}, {4, false, Manager}, // Vaultwarden reports a manager as type 4
+		{3, false, Manager}, {4, false, Manager}, // Vaultwarden meldet einen Manager als Typ 4
 		{3, true, Custom}, {4, true, Custom},
-		{2, true, User}, // permissions only matter for type 3 and 4
+		{2, true, User}, // Berechtigungen zählen nur bei Typ 3 und 4
 		{7, false, Unknown},
 	}
 	for _, c := range cases {

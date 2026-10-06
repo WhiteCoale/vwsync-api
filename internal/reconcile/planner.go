@@ -10,29 +10,29 @@ import (
 type ChangeType string
 
 const (
-	Invite     ChangeType = "invite" // in the desired state, not in the org
-	ChangeRole ChangeType = "role"   // member with a different role than desired
-	Remove     ChangeType = "remove" // member not in the desired state
+	Invite     ChangeType = "invite" // im Soll, aber nicht in der Org
+	ChangeRole ChangeType = "role"   // Mitglied mit anderer Rolle als im Soll
+	Remove     ChangeType = "remove" // Mitglied, das nicht im Soll steht
 )
 
-// Change is one planned modification. It describes, it does not execute.
+// Change ist eine geplante Änderung. Sie beschreibt nur und führt nichts aus.
 type Change struct {
 	Type  ChangeType  `json:"type"`
 	Email string      `json:"email"`
-	Role  *model.Role `json:"role,omitempty"` // target role (invite, role)
-	From  *model.Role `json:"from,omitempty"` // current role (role)
+	Role  *model.Role `json:"role,omitempty"` // Zielrolle (invite, role)
+	From  *model.Role `json:"from,omitempty"` // bisherige Rolle (role)
 
-	member model.Member // existing membership (role, remove)
+	member model.Member // bestehende Mitgliedschaft (role, remove)
 }
 
-// OrgPlan is the result of planning one organization.
+// OrgPlan ist das Ergebnis der Planung für eine Organisation.
 type OrgPlan struct {
 	Org      model.Organization `json:"org"`
 	Changes  []Change           `json:"changes"`
 	Warnings []string           `json:"warnings"`
 }
 
-// Removals counts planned removals. It is the basis of the removal limit.
+// Removals zählt die geplanten Entfernungen. Darauf beruht die Obergrenze max_removals.
 func (p OrgPlan) Removals() int {
 	n := 0
 	for _, c := range p.Changes {
@@ -43,9 +43,10 @@ func (p OrgPlan) Removals() int {
 	return n
 }
 
-// Plan diffs desired against current. It is a pure function. Planning is idempotent: once a plan has
-// been applied, planning again yields no changes. The own account is never touched, so an operator
-// cannot lock themselves out. The order of changes is stable (sorted by e-mail).
+// Plan vergleicht Soll und Ist. Die Funktion ist rein und ohne Seiteneffekte. Die Planung ist
+// idempotent. Nach der Ausführung eines Plans ergibt eine erneute Planung keine Änderungen. Das
+// eigene Konto bleibt immer unberührt, damit sich der Betreiber nicht aussperrt. Die Reihenfolge der
+// Änderungen ist stabil, sortiert nach E-Mail.
 func Plan(org model.Organization, desired map[string]model.Role, current []model.Member, selfEmail string, allowRemoval bool) OrgPlan {
 	byEmail := make(map[string]model.Member, len(current))
 	for _, m := range current {
@@ -63,7 +64,7 @@ func Plan(org model.Organization, desired map[string]model.Role, current []model
 		case !exists:
 			plan.Changes = append(plan.Changes, Change{Type: Invite, Email: email, Role: &role})
 		case m.Status == model.Revoked:
-			// Revoked is a deliberate admin decision; it is not lifted automatically.
+			// Eine Sperre ist die bewusste Entscheidung eines Admins und wird nicht automatisch aufgehoben.
 			plan.Warnings = append(plan.Warnings, fmt.Sprintf("%s is revoked in %q and was skipped", email, org.Name))
 		case m.Role != role:
 			from := m.Role
@@ -77,8 +78,8 @@ func Plan(org model.Organization, desired map[string]model.Role, current []model
 				continue
 			}
 			if byEmail[email].Status == model.Revoked {
-				// A revoked member is a deliberate admin decision, and /v1/export leaves revoked members
-				// out of "desired". Removing them would delete what an admin only suspended.
+				// Eine Sperre ist die bewusste Entscheidung eines Admins, und /v1/export lässt gesperrte
+				// Mitglieder in "desired" weg. Sie zu entfernen, würde löschen, was ein Admin nur ausgesetzt hat.
 				plan.Warnings = append(plan.Warnings, fmt.Sprintf("%s is revoked in %q and was left alone", email, org.Name))
 				continue
 			}
