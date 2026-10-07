@@ -8,11 +8,13 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 
@@ -29,22 +31,64 @@ type fakeVW struct {
 	handlers map[string]string
 	login    map[string]any
 	reject   atomic.Int32 // Anzahl der nächsten /api-Aufrufe, die mit 401 beantwortet werden
+
+	// Mit rotating gibt jeder Login ein neues Token "tok-N" aus, und nur das zuletzt ausgegebene gilt.
+	// revoke macht das aktuelle Token ungültig, loginStatus lässt Logins mit diesem Status scheitern.
+	mu          sync.Mutex
+	rotating    bool
+	valid       string
+	loginStatus int
+}
+
+func (f *fakeVW) revoke() {
+	f.mu.Lock()
+	f.valid = "revoked"
+	f.mu.Unlock()
+}
+
+func (f *fakeVW) setLoginStatus(code int) {
+	f.mu.Lock()
+	f.loginStatus = code
+	f.mu.Unlock()
 }
 
 func (f *fakeVW) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	b, _ := io.ReadAll(r.Body)
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.calls = append(f.calls, call{r.Method, r.URL.RequestURI(), string(b)})
+	if r.URL.Path == "/alive" {
+		_, _ = w.Write([]byte(`"ok"`))
+		return
+	}
 	if r.URL.Path == "/identity/connect/token" {
-		f.logins.Add(1)
+		n := f.logins.Add(1)
 		form, _ := url.ParseQuery(string(b))
 		if form.Get("client_id") != "user.1" || form.Get("client_secret") != "s3cret" {
 			http.Error(w, `{"error":"invalid_client"}`, 400)
 			return
 		}
-		_ = json.NewEncoder(w).Encode(f.login)
+		if f.loginStatus != 0 {
+			http.Error(w, `{"error":"unavailable"}`, f.loginStatus)
+			return
+		}
+		answer := f.login
+		if f.rotating {
+			f.valid = fmt.Sprintf("tok-%d", n)
+			answer = map[string]any{}
+			for k, v := range f.login {
+				answer[k] = v
+			}
+			answer["access_token"] = f.valid
+		}
+		_ = json.NewEncoder(w).Encode(answer)
 		return
 	}
-	if r.Header.Get("Authorization") != "Bearer tok" || f.reject.Add(-1) >= 0 {
+	want := "tok"
+	if f.rotating {
+		want = f.valid
+	}
+	if r.Header.Get("Authorization") != "Bearer "+want || f.reject.Add(-1) >= 0 {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}

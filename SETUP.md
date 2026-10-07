@@ -9,7 +9,7 @@ Für alle, die den Ablauf kennen. Jeder Befehl ist in den Schritten darunter erk
 ```bash
 # Auf dem Rechner mit Go, im Projektverzeichnis
 make linux
-scp dist/vwsync-api deploy/vwsync-api.service deploy/nginx.conf admin@vwsync-server:
+scp dist/vwsync-api deploy/vwsync-api.service deploy/vwsync-api.logrotate deploy/nginx.conf admin@vwsync-server:
 
 # Auf dem vwsync-Server, im Home-Verzeichnis
 sudo useradd --system --no-create-home --shell /usr/sbin/nologin vwsync
@@ -19,8 +19,9 @@ sudo install -m 0755 vwsync-api /opt/vwsync-api/vwsync-api
 sudoedit /etc/vwsync-api/env                   # Inhalt nach Schritt 5
 sudo chown root:vwsync /etc/vwsync-api/env && sudo chmod 0640 /etc/vwsync-api/env
 sudo install -m 0644 vwsync-api.service /etc/systemd/system/
+sudo install -m 0644 vwsync-api.logrotate /etc/logrotate.d/vwsync-api
 sudo systemctl daemon-reload && sudo systemctl enable --now vwsync-api
-curl -s http://127.0.0.1:8080/healthz          # {"status":"ok"}
+curl -s http://127.0.0.1:8080/readyz           # {"status":"ready"}
 # Danach nginx und TLS einrichten (Schritt 7)
 ```
 
@@ -55,11 +56,46 @@ Zwei Verbindungen müssen offen sein. Der Aufrufer muss den vwsync-Server auf Po
 
 | Voraussetzung | Zweck |
 |---|---|
-| Eigener Linux-Server mit systemd und nginx | Hier läuft der Dienst. Er lauscht nur auf `127.0.0.1`, nginx ist der einzige Zugang |
+| Eigener Linux-Server mit systemd ab Version 239 und nginx, etwa Rocky Linux 8 oder 9, RHEL oder Debian 12 | Hier läuft der Dienst. Er lauscht nur auf `127.0.0.1`, nginx ist der einzige Zugang. Für Rocky Linux und RHEL gelten zusätzlich die [Hinweise unten](#rocky-linux-und-rhel) |
 | Domain mit DNS-Eintrag und TLS-Zertifikat | nginx terminiert HTTPS. Ohne TLS gehen Zugangsdaten im Klartext über die Leitung |
 | Vaultwarden auf einem anderen Server, per HTTPS erreichbar | Der Dienst nutzt dessen Benutzer-API über das Netz. Die Pfade `/identity` und `/api` müssen vom vwsync-Server aus erreichbar sein |
 | Go ab Version 1.26 | Nur zum Bauen, auf einem beliebigen Rechner. Der Server braucht kein Go |
 | Ein eigenes Vaultwarden-Konto für den Dienst | Siehe Schritt 1 |
+
+### Rocky Linux und RHEL
+
+Auf Rocky Linux und RHEL 8 und 9 laufen Dienst, Unit und logrotate-Vorlage unverändert. Fünf Dinge sind dort anders als auf Debian, sie gehören zu den Schritten unten.
+
+**SELinux und nginx (Schritt 7).** Rocky läuft mit SELinux im Modus enforcing. nginx darf dann nicht zu einem lokalen Port wie 8080 verbinden und antwortet mit `502`, im Audit-Log steht ein `denied` für `name_connect`. Diese Freigabe gilt dauerhaft:
+
+```bash
+sudo setsebool -P httpd_can_network_connect 1
+```
+
+**SELinux und das Binary (Schritt 3).** Kopiere das Binary mit `install` nach `/opt/vwsync-api`, nicht mit `mv` aus dem Home-Verzeichnis. Sonst behält es den SELinux-Kontext des Home-Verzeichnisses, und systemd startet es nicht (`status=203/EXEC`). Damit systemd es sicher ausführen darf, bekommt das Verzeichnis den Kontext für Programme:
+
+```bash
+sudo dnf install -y policycoreutils-python-utils
+sudo semanage fcontext -a -t bin_t '/opt/vwsync-api(/.*)?'
+sudo restorecon -Rv /opt/vwsync-api
+```
+
+**Firewall (Schritt 7).** firewalld lässt HTTP und HTTPS erst nach einer Freigabe durch. HTTP braucht certbot und die Umleitung auf HTTPS.
+
+```bash
+sudo firewall-cmd --permanent --add-service=http --add-service=https
+sudo firewall-cmd --reload
+```
+
+**nginx und certbot (Schritt 7).** nginx kommt aus den Standardquellen, certbot aus EPEL. Die Konfiguration gehört nach `/etc/nginx/conf.d/vwsync.conf`, ein `sites-available` gibt es nicht.
+
+```bash
+sudo dnf install -y nginx epel-release
+sudo dnf install -y certbot python3-certbot-nginx
+sudo systemctl enable --now nginx
+```
+
+**logrotate und Rocky 8.** logrotate ist vorinstalliert und läuft täglich, auf Rocky 9 über einen systemd-Timer, auf Rocky 8 über cron. Rocky 8 bringt systemd 239 mit. Vier Härtungs-Einträge der Unit kennt es noch nicht (`ProtectClock`, `ProtectHostname`, `ProtectKernelLogs`, `RestrictSUIDSGID`). Es meldet dazu beim `daemon-reload` eine Warnung `Unknown lvalue` im Journal und ignoriert sie. Der Dienst läuft trotzdem, die übrige Härtung bleibt aktiv.
 
 ## 1. Vaultwarden vorbereiten
 
@@ -99,10 +135,10 @@ go build -trimpath -ldflags="-s -w" -o dist/vwsync-api ./cmd/vwsync-api
 
 Für einen ARM-Server gilt `GOARCH=arm64`.
 
-Kopiere das Binary und die beiden Vorlagen aus `deploy/` auf den vwsync-Server, zum Beispiel ins Home-Verzeichnis. Die folgenden Schritte laufen dort.
+Kopiere das Binary und die drei Vorlagen aus `deploy/` auf den vwsync-Server, zum Beispiel ins Home-Verzeichnis. Die folgenden Schritte laufen dort.
 
 ```bash
-scp dist/vwsync-api deploy/vwsync-api.service deploy/nginx.conf admin@vwsync-server:
+scp dist/vwsync-api deploy/vwsync-api.service deploy/vwsync-api.logrotate deploy/nginx.conf admin@vwsync-server:
 ```
 
 ## 3. Server vorbereiten
@@ -135,6 +171,7 @@ Lege `/etc/vwsync-api/env` an. Eine Vorlage liegt in [.env.example](.env.example
 VWSYNC_LISTEN=127.0.0.1:8080
 VWSYNC_API_KEY_HASH=...
 VWSYNC_TRUST_PROXY=true
+VWSYNC_LOG_FILE=/var/log/vwsync-api/vwsync-api.log
 
 VW_URL=https://vault.example.com
 VW_CLIENT_ID=user.00000000-0000-0000-0000-000000000000
@@ -148,6 +185,7 @@ VW_MASTER_PASSWORD=...
 | `VWSYNC_LISTEN` | nein | Adresse und Port. Standard ist `127.0.0.1:8080`. Nicht auf `0.0.0.0` setzen |
 | `VWSYNC_API_KEY_HASH` | ja | SHA-256-Hash des Zugangsschlüssels aus Schritt 4, 64 Hex-Zeichen. Mehrere Hashes durch Kommas getrennt gelten gleichzeitig, das erleichtert den Austausch eines Schlüssels |
 | `VWSYNC_TRUST_PROXY` | nein | `true`, wenn nginx den Header `X-Real-IP` setzt. Der Dienst glaubt den Header nur bei Anfragen von `127.0.0.1` oder `::1`, nginx muss also auf demselben Server laufen. Ohne diese Einstellung steht bei abgewiesenen Aufrufen die Adresse von nginx im Log statt die des Aufrufers |
+| `VWSYNC_LOG_FILE` | nein | Logdatei, unter systemd `/var/log/vwsync-api/vwsync-api.log`. Die Unit legt das Verzeichnis `/var/log/vwsync-api` an, nur dort darf der Dienst schreiben, weil der Rest des Dateisystems schreibgeschützt ist. Ohne die Variable geht das Log ins Journal von systemd |
 | `VWSYNC_LOG_LEVEL` | nein | `debug`, `info` (Standard), `warn` oder `error`. Mit `debug` protokolliert der Dienst jeden Aufruf an Vaultwarden mit Methode, Pfad, Status und Dauer, nie mit Bodies oder Schlüsseln |
 | `VWSYNC_LOG_FORMAT` | nein | `text` (Standard) oder `json`, etwa für Loki oder ELK |
 | `VW_URL` | ja | Adresse von Vaultwarden ohne abschließenden Schrägstrich. Sie muss mit `https://` beginnen. Unverschlüsseltes `http://` akzeptiert der Dienst nur für `localhost`, weil API-Key und Schlüsselmaterial über diese Verbindung gehen |
@@ -168,18 +206,34 @@ sudo chmod 0640 /etc/vwsync-api/env
 
 ```bash
 sudo install -m 0644 vwsync-api.service /etc/systemd/system/
+sudo install -m 0644 vwsync-api.logrotate /etc/logrotate.d/vwsync-api
 sudo systemctl daemon-reload
 sudo systemctl enable --now vwsync-api
 sudo systemctl status vwsync-api
-curl -s http://127.0.0.1:8080/healthz
-# {"status":"ok"}
+curl -s http://127.0.0.1:8080/readyz
+# {"status":"ready"}
 ```
 
-`journalctl -u vwsync-api -f` zeigt das Log. Beim Start meldet sich der Dienst einmal bei Vaultwarden an und schreibt eine Zeile wie `msg=listening addr=127.0.0.1:8080 version=v1.0.0 confirm_enabled=true`. Falsche API-Key-Daten oder eine falsche `VW_URL` brechen den Start mit einer klaren Meldung ab. Fehlende Variablen meldet der Dienst gesammelt.
+`systemctl start` kehrt erst zurück, wenn der Dienst bereit ist. Er hat dann seinen Port belegt, sich bei Vaultwarden angemeldet und das an systemd gemeldet (`Type=notify`). `systemctl status` zeigt danach `active (running)` und eine Statuszeile wie `Status: "ready"`. Die erste Zeile im Log lautet etwa `msg=listening addr=127.0.0.1:8080 version=v1.0.0 confirm_enabled=true log_file=/var/log/vwsync-api/vwsync-api.log`.
 
-Die Unit startet den Dienst als eigenen Benutzer ohne Schreibrechte im Dateisystem, ohne zusätzliche Capabilities und mit eingeschränkten Systemaufrufen.
+### Verhalten unter systemd
 
-`TimeoutStopSec=900` ist beabsichtigt. Ein `stop` oder `restart` wartet auf einen laufenden Sync oder Confirm, bis zu 15 Minuten, statt ihn nach den üblichen 90 Sekunden abzubrechen. Der Dienst nimmt in dieser Zeit keine neuen Anfragen an. Wer die Wartezeit verkürzen möchte, ändert den Wert in der Unit. Ein erneuter Aufruf holt Unterbrochenes nach.
+| Befehl oder Ereignis | Was der Dienst tut |
+|---|---|
+| `systemctl start` | Prüft die Konfiguration, öffnet die Logdatei, belegt den Port, meldet sich bei Vaultwarden an und meldet sich bereit |
+| `systemctl stop` | Meldet `deactivating`, nimmt keine neuen Verbindungen mehr an und lässt laufende Requests zu Ende laufen, bis zu 14 Minuten. Ein Sync wird also nicht mittendrin abgebrochen. Danach endet der Prozess mit Code 0 |
+| `systemctl restart` | Wie `stop`, danach `start` |
+| `systemctl reload` | Öffnet die Logdatei neu, etwa nach logrotate. Laufende Requests merken davon nichts |
+| `systemctl kill vwsync-api` während des Wartens | Sendet ein zweites SIGTERM. Der Dienst bricht laufende Requests sofort ab und endet mit Code 0. Ein zweites `systemctl stop` reicht dafür nicht, es wartet nur weiter |
+| Absturz oder unerwarteter Fehler | systemd startet den Dienst nach 5 Sekunden neu, höchstens 10 Mal in 5 Minuten |
+| Dienst hängt | Der Dienst meldet systemd regelmäßig, dass er auf `/healthz` antwortet. Bleibt das 60 Sekunden aus, beendet systemd ihn und startet ihn neu (`WatchdogSec`). Im Journal steht dann `Failed with result 'watchdog'` und ein Stacktrace, der zeigt, wo der Prozess hing |
+| Fehler in der Konfiguration | Der Prozess endet mit Code 78. `systemctl status` zeigt `failed` mit `status=78`, und systemd startet ihn nicht neu, denn ein Neustart änderte nichts. Dazu gehören fehlende Variablen, eine nicht beschreibbare Logdatei und ein von Vaultwarden abgelehnter API-Key |
+| Vaultwarden beim Start nicht erreichbar | Der Dienst startet trotzdem und meldet sich beim ersten Request an. `/readyz` antwortet bis dahin mit `503`, im Log steht `vaultwarden is not reachable`. Startet etwa der Vaultwarden-Server gleichzeitig neu, muss niemand eingreifen |
+| Token von Vaultwarden läuft ab | Der Dienst erneuert es von selbst kurz vor Ablauf. Erklärt Vaultwarden es vorher für ungültig, meldet sich der Dienst einmal neu an und wiederholt den Request |
+
+`/healthz` meldet nur, dass der Prozess antwortet. `/readyz` meldet, ob der Dienst gerade arbeiten kann, also ob Vaultwarden antwortet und der Dienst nicht herunterfährt. Für Überwachung und Load-Balancer ist `/readyz` die richtige Wahl.
+
+Die Unit startet den Dienst als eigenen Benutzer ohne Schreibrechte im Dateisystem, mit Ausnahme von `/var/log/vwsync-api`, ohne zusätzliche Capabilities und mit eingeschränkten Systemaufrufen.
 
 ## 7. nginx und TLS
 
@@ -237,7 +291,17 @@ Weil schreibende Aufrufe sofort ausgeführt werden, sollte jede neue Soll-Datei 
 
 ### Logs
 
-`journalctl -u vwsync-api` zeigt das Log. Der Dienst schreibt je Anfrage Methode, Pfad, Query, Status und Dauer. Die Query verrät, ob `dry_run=true` gesetzt war und der Aufruf nur eine Vorschau lieferte. Dazu kommen abgewiesene Aufrufe mit der Adresse des Aufrufers (`request rejected`) und für jede ausgeführte Änderung eine Zeile `audit`.
+Mit `VWSYNC_LOG_FILE=/var/log/vwsync-api/vwsync-api.log` schreibt der Dienst sein Log in diese Datei.
+
+```bash
+sudo tail -f /var/log/vwsync-api/vwsync-api.log
+```
+
+Ohne die Variable geht das Log ins Journal (`journalctl -u vwsync-api`). Fehler, die auftreten, bevor die Logdatei offen ist, etwa eine falsche Konfiguration, stehen immer im Journal. Bei einem Startproblem lohnt deshalb zuerst `journalctl -u vwsync-api -n 50`.
+
+**Rotation.** Sie läuft automatisch, sobald die Vorlage `/etc/logrotate.d/vwsync-api` installiert ist. logrotate wird vom System täglich aufgerufen, rotiert die Datei, komprimiert ältere Dateien und hebt 30 Tage auf. Danach ruft es `systemctl reload vwsync-api` auf, und der Dienst öffnet sofort die neue Datei. Kommt dieser Aufruf nicht an, etwa wegen einer SELinux-Regel, bemerkt der Dienst die Rotation spätestens zehn Sekunden später selbst und öffnet die neue Datei. Es gehen in keinem Fall Zeilen verloren, und laufende Requests merken davon nichts. `systemctl list-timers logrotate.timer` zeigt den nächsten Lauf, `sudo logrotate -d /etc/logrotate.d/vwsync-api` macht einen Probelauf ohne Änderung. Aufbewahrung und Intervall lassen sich in der Vorlage ändern. Die Logs enthalten E-Mail-Adressen, die Aufbewahrungsdauer sollte deshalb zu den Datenschutzvorgaben passen.
+
+**Inhalt.** Der Dienst schreibt je Anfrage Methode, Pfad, Query, Status und Dauer. Die Query verrät, ob `dry_run=true` gesetzt war und der Aufruf nur eine Vorschau lieferte. Dazu kommen abgewiesene Aufrufe mit der Adresse des Aufrufers (`request rejected`) und für jede ausgeführte Änderung eine Zeile `audit`.
 
 ```
 level=INFO msg=audit org="Team Alpha" type=invite email=carol@example.com ok=true role=user
@@ -245,7 +309,7 @@ level=INFO msg=audit org="Team Alpha" type=remove email=dave@example.com ok=true
 level=INFO msg=audit org="Team Alpha" type=confirm email=alice@example.com ok=true
 ```
 
-`journalctl -u vwsync-api | grep audit` listet alle Änderungen. Header, Bodies, Schlüssel und Passwörter stehen nie im Log. Bei einem Absturz steht der Stacktrace im Log, der Aufrufer erhält nur eine Referenz wie `internal error (ref 1a2b3c4d)`.
+`grep msg=audit /var/log/vwsync-api/vwsync-api.log` listet alle Änderungen, `zgrep` auch in rotierten Dateien. Header, Bodies, Schlüssel und Passwörter stehen nie im Log. Bei einem Absturz steht der Stacktrace im Log, der Aufrufer erhält nur eine Referenz wie `internal error (ref 1a2b3c4d)`.
 
 ### Version
 
@@ -275,6 +339,8 @@ Der Dienst hält keinen Zustand auf der Platte. Zu sichern ist nur `/etc/vwsync-
 - [ ] Der Dienst lauscht nur auf `127.0.0.1`. nginx läuft auf demselben Server und ist der einzige Zugang.
 - [ ] HTTPS mit gültigem Zertifikat.
 - [ ] `/etc/vwsync-api/env` gehört `root:vwsync` und hat die Rechte `0640`.
+- [ ] Das Log geht nach `/var/log/vwsync-api/`, und `/etc/logrotate.d/vwsync-api` ist installiert.
+- [ ] Die Überwachung fragt `/readyz` ab.
 - [ ] Der Dienst nutzt ein eigenes Vaultwarden-Konto.
 - [ ] Der Zugangsschlüssel liegt nur beim Aufrufer, in einer Datei mit Rechten `0600` oder einem Secret-Store, nicht in Crontab, Repository oder Log.
 - [ ] Der Zugangsschlüssel wird nie in einer URL übergeben, nur im Header `Authorization`.
@@ -287,9 +353,11 @@ Der Dienst hält keinen Zustand auf der Platte. Zu sichern ist nur `/etc/vwsync-
 | Start bricht ab mit `invalid configuration: ... is missing` | Eine Variable fehlt oder ist leer | Die Meldung nennt alle fehlenden Variablen. `env`-Datei prüfen |
 | Start bricht ab mit `VWSYNC_API_KEY_HASH is missing` | Die Variable fehlt oder ist leer | Mit `vwsync-api generate-key` Schlüssel und Hash erzeugen und die Zeile `VWSYNC_API_KEY_HASH=...` eintragen |
 | Start bricht ab mit `VWSYNC_API_KEY_HASH: ... is not a SHA-256 hash` | Der Hash ist abgeschnitten, oder statt des Hashes steht der Schlüssel selbst | Die Hash-Zeile aus `generate-key` verwenden, sie hat 64 Hex-Zeichen. Der Schlüssel beginnt mit `vwsk_` und gehört nur zum Aufrufer |
-| Start bricht ab mit `vaultwarden login: ... invalid_client` | `VW_CLIENT_ID` oder `VW_CLIENT_SECRET` ist falsch | API-Key im Web-Vault erneut ansehen. Die `client_id` beginnt mit `user.` |
-| Start bricht ab mit `vaultwarden login: ... connection refused` oder Zeitüberschreitung | `VW_URL` ist falsch, oder der Vaultwarden-Server ist vom vwsync-Server aus nicht erreichbar | Vom vwsync-Server aus `curl $VW_URL/alive` prüfen. Firewall und Reverse-Proxy von Vaultwarden kontrollieren |
-| Start bricht ab mit `certificate signed by unknown authority` | Das Zertifikat von Vaultwarden stammt von einer CA, die der vwsync-Server nicht kennt | Das CA-Zertifikat als PEM ablegen und `VW_CA_FILE` setzen |
+| `systemctl status` zeigt `failed` und `status=78` | Fehler in der Konfiguration. Die genaue Meldung steht im Journal | `journalctl -u vwsync-api -n 50` lesen, die Ursache beheben, `systemctl restart vwsync-api` |
+| Start bricht ab mit `vaultwarden rejected the API key` | `VW_CLIENT_ID` oder `VW_CLIENT_SECRET` ist falsch | API-Key im Web-Vault erneut ansehen. Die `client_id` beginnt mit `user.` |
+| Start bricht ab mit `VWSYNC_LOG_FILE: opening log file` | Das Verzeichnis fehlt oder liegt außerhalb von `/var/log/vwsync-api` | Den Pfad unter `/var/log/vwsync-api/` legen. Nur dort darf der Dienst schreiben |
+| Log zeigt `vaultwarden is not reachable`, `/readyz` meldet `503` | `VW_URL` ist falsch, oder der Vaultwarden-Server ist vom vwsync-Server aus nicht erreichbar | Vom vwsync-Server aus `curl $VW_URL/alive` prüfen. Firewall und Reverse-Proxy von Vaultwarden kontrollieren. Der Dienst erholt sich von selbst, sobald Vaultwarden erreichbar ist |
+| Log zeigt `certificate signed by unknown authority` | Das Zertifikat von Vaultwarden stammt von einer CA, die der vwsync-Server nicht kennt | Das CA-Zertifikat als PEM ablegen und `VW_CA_FILE` setzen |
 | Start bricht ab mit `VW_URL must use https` | `VW_URL` beginnt mit `http://` und zeigt nicht auf `localhost` | HTTPS am Vaultwarden-Reverse-Proxy einrichten und die URL anpassen |
 | `401` bei jedem Aufruf | Der Schlüssel fehlt oder ist falsch, oder der Header hat nicht die Form `Authorization: Bearer <Schlüssel>` | Im Log steht `request rejected` mit der Adresse des Aufrufers. Ob der Schlüssel zur Konfiguration passt, zeigt `printf %s "$KEY" \| sha256sum`. Das Ergebnis muss einem Eintrag in `VWSYNC_API_KEY_HASH` entsprechen |
 | `404` bei `/v1/sync` | Der Organisationsname stimmt nicht, oder das Konto ist dort weder Owner noch Admin | `GET /v1/orgs` zeigt, welche Organisationen der Dienst sieht. Die Groß- und Kleinschreibung spielt keine Rolle |
@@ -305,3 +373,7 @@ Der Dienst hält keinen Zustand auf der Platte. Zu sichern ist nur `/etc/vwsync-
 | `502` mit einer Meldung von Vaultwarden | Vaultwarden lehnt den Aufruf ab | Meldung lesen. Häufige Gründe sind fehlende Owner-Rechte für `admin` oder `custom`, `ORG_CREATION_USERS` und die Richtlinie "Single organization" |
 | nginx meldet `504` bei großen Läufen | Das Timeout ist zu kurz | `proxy_read_timeout` in der Proxy-Datei erhöhen |
 | nginx meldet `413` | Der Body ist größer als 1 MB | `client_max_body_size` in der Konfiguration erhöhen |
+| `systemctl stop` dauert lange | Ein Sync oder Confirm läuft noch, der Dienst wartet bis zu 14 Minuten darauf | Abwarten. `systemctl kill vwsync-api` bricht sofort ab, laufende Requests enden dann mit einem Fehler |
+| Die Logdatei wird nie rotiert | Die logrotate-Vorlage fehlt | `/etc/logrotate.d/vwsync-api` installieren. Nach einer Rotation folgt der Dienst der neuen Datei spätestens nach zehn Sekunden, auch ohne `reload` |
+| nginx meldet `502`, das Log des Dienstes zeigt keinen Request | SELinux verbietet nginx die Verbindung zum Dienst (Rocky, RHEL) | `sudo setsebool -P httpd_can_network_connect 1` |
+| `systemctl status` zeigt `status=203/EXEC` | SELinux verbietet systemd das Ausführen des Binarys (Rocky, RHEL) | Kontext setzen wie unter [Rocky Linux und RHEL](#rocky-linux-und-rhel) beschrieben |

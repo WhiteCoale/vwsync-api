@@ -19,6 +19,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 
@@ -33,6 +34,7 @@ const (
 	defaultMaxRemovals = 5
 	writeTimeout       = 10 * time.Minute
 	maxOrgNameLen      = 50
+	readyTimeout       = 5 * time.Second
 )
 
 // Directory ist alles, was die Handler von Vaultwarden brauchen, also die Operationen für den Abgleich
@@ -48,6 +50,10 @@ type Deps struct {
 	Dir        Directory
 	Log        *slog.Logger
 	TrustProxy bool
+	// Ping prüft für /readyz, ob Vaultwarden erreichbar ist. Ohne Ping gilt der Dienst als bereit.
+	Ping func(context.Context) error
+	// Stopping ist gesetzt, sobald der Dienst herunterfährt. /readyz meldet dann 503.
+	Stopping *atomic.Bool
 }
 
 type server struct {
@@ -64,6 +70,7 @@ func New(d Deps) http.Handler {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) { writeJSON(w, 200, map[string]string{"status": "ok"}) })
+	mux.HandleFunc("GET /readyz", s.ready)
 	mux.Handle("GET /v1/orgs", s.authed(s.listOrgs))
 	mux.Handle("POST /v1/orgs", s.authed(s.createOrg))
 	mux.Handle("GET /v1/orgs/{org}/members", s.authed(s.orgMembers))
@@ -72,6 +79,27 @@ func New(d Deps) http.Handler {
 	mux.Handle("POST /v1/confirm", s.authed(s.confirm))
 
 	return s.logging(s.recoverPanic(mux))
+}
+
+// ready beantwortet /readyz. Anders als /healthz, das nur meldet, dass der Prozess lebt, prüft es, ob
+// der Dienst gerade Aufträge erledigen kann. Das ist nicht der Fall, solange er herunterfährt oder
+// Vaultwarden nicht antwortet. Der Grund steht nur im Log, nicht in der Antwort, denn der Endpunkt
+// braucht keinen Schlüssel.
+func (s *server) ready(w http.ResponseWriter, r *http.Request) {
+	if s.Stopping != nil && s.Stopping.Load() {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"status": "stopping"})
+		return
+	}
+	if s.Ping != nil {
+		ctx, cancel := context.WithTimeout(r.Context(), readyTimeout)
+		defer cancel()
+		if err := s.Ping(ctx); err != nil {
+			s.Log.Warn("readiness check failed", "err", err)
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"status": "vaultwarden unreachable"})
+			return
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ready"})
 }
 
 // --- auth ---------------------------------------------------------------------------------------

@@ -27,6 +27,9 @@ type Config struct {
 	// LogLevel ist debug, info, warn oder error. LogJSON stellt das Logformat von Text auf JSON um.
 	LogLevel slog.Level
 	LogJSON  bool
+	// LogFile ist die Datei, in die das Log geschrieben wird. Leer bedeutet Standardfehlerausgabe, unter
+	// systemd also das Journal.
+	LogFile string
 
 	// Vaultwarden.
 	VWURL          string
@@ -58,6 +61,7 @@ func FromEnv() (Config, error) {
 		VWClientSecret:   req("VW_CLIENT_SECRET"),
 		VWMasterPassword: os.Getenv("VW_MASTER_PASSWORD"),
 		VWCAFile:         os.Getenv("VW_CA_FILE"),
+		LogFile:          os.Getenv("VWSYNC_LOG_FILE"),
 	}
 	if c.VWURL != "" {
 		if err := checkVaultwardenURL(c.VWURL); err != nil {

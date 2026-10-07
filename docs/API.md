@@ -54,6 +54,7 @@ Der Parameter `apply` wird nicht unterstützt. Wer ihn sendet, erhält `400`, da
 | Methode | Pfad | Authentifizierung | Zweck |
 |---|---|---|---|
 | `GET` | `/healthz` | nein | Lebenszeichen des Prozesses |
+| `GET` | `/readyz` | nein | Bereitschaft: Vaultwarden erreichbar, Dienst fährt nicht herunter |
 | `GET` | `/v1/orgs` | ja | Verwaltbare Organisationen auflisten |
 | `POST` | `/v1/orgs` | ja | Organisation anlegen |
 | `GET` | `/v1/orgs/{org}/members` | ja | Mitglieder einer Organisation |
@@ -94,6 +95,20 @@ curl $BASE/healthz
 ```json
 { "status": "ok" }
 ```
+
+### `GET /readyz`
+
+Meldet, ob der Dienst gerade arbeiten kann. Dazu prüft er, ob Vaultwarden antwortet, und ob er selbst nicht gerade herunterfährt. Für Überwachung und Load-Balancer ist dieser Endpunkt die richtige Wahl. Er braucht keinen Schlüssel.
+
+```bash
+curl $BASE/readyz
+```
+
+| Code | Antwort | Bedeutung |
+|---|---|---|
+| `200` | `{"status":"ready"}` | Bereit |
+| `503` | `{"status":"vaultwarden unreachable"}` | Vaultwarden antwortet nicht innerhalb von 5 Sekunden. Der Grund steht im Log des Dienstes, nicht in der Antwort |
+| `503` | `{"status":"stopping"}` | Der Dienst fährt herunter und lässt nur noch laufende Requests zu Ende laufen |
 
 ---
 

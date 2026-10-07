@@ -18,6 +18,7 @@ Der Dienst läuft auf einem eigenen Server und ruft Vaultwarden über HTTPS auf 
 | `POST /v1/orgs` | Organisation anlegen |
 | `GET /v1/orgs/{org}/members` | Mitglieder einer Organisation mit Rolle und Status |
 | `GET /v1/export` | Ist-Zustand aller Organisationen, zugleich Vorlage für den Abgleich |
+| `GET /healthz`, `GET /readyz` | Lebenszeichen und Bereitschaft, ohne Schlüssel |
 | `POST /v1/sync` | Einladen, Rollen ändern und Entfernen nach Soll-Zustand |
 | `POST /v1/confirm` | Mitglieder bestätigen, die sich registriert haben |
 
@@ -30,7 +31,8 @@ Die vollständige Anleitung steht in [SETUP.md](SETUP.md). Kurzfassung für eine
 ```bash
 go build -o vwsync-api ./cmd/vwsync-api
 ./vwsync-api generate-key           # gibt den Zugangsschlüssel und die Zeile für die Konfiguration aus
-cp .env.example .env                # Werte eintragen, darunter VWSYNC_API_KEY_HASH aus dem letzten Schritt
+cp .env.example .env                # Werte eintragen, darunter VWSYNC_API_KEY_HASH aus dem letzten Schritt.
+                                    # VWSYNC_LOG_FILE leeren, dann geht das Log auf die Konsole
 set -a; . ./.env; set +a            # Datei als Umgebungsvariablen laden
 ./vwsync-api serve
 ```
@@ -126,6 +128,10 @@ stateDiagram-v2
 - **Teilfehler.** Eine fehlgeschlagene Änderung stoppt die übrigen nicht. Die Antwort `207` nennt die Fehler. Weil der Abgleich idempotent ist, holt ein erneuter Aufruf den Rest nach.
 - **Erhalt von Zugriffen.** Rollenwechsel behalten bestehende Zuordnungen zu Sammlungen.
 
+## Betrieb als Dienst
+
+vwsync-api läuft unter systemd als `Type=notify`-Dienst. `systemctl start` kehrt erst zurück, wenn der Dienst bereit ist. `systemctl stop` und `restart` lassen laufende Requests zu Ende laufen, ein Sync wird nicht mittendrin abgebrochen. `systemctl reload` öffnet die Logdatei neu, die mitgelieferte logrotate-Vorlage nutzt das. Ein Watchdog startet den Dienst neu, wenn er nicht mehr antwortet. Ist Vaultwarden beim Start nicht erreichbar, startet der Dienst trotzdem und meldet den Zustand über `/readyz`. Ein falscher API-Key oder eine falsche Konfiguration beenden ihn dagegen mit Code 78, ohne Neustart-Schleife. Einzelheiten stehen in [SETUP.md](SETUP.md#verhalten-unter-systemd).
+
 ## Sicherheit des Dienstes
 
 - **Zugangsschlüssel.** Aufrufer senden einen festen Schlüssel mit 256 Bit Zufall im Header `Authorization: Bearer`. Der Dienst speichert nur dessen SHA-256-Hash und vergleicht in konstanter Zeit. Es gibt keinen Login und keine Sitzungen. Der Schlüssel läuft nicht ab. Wer ihn sperren will, entfernt seinen Hash aus der Konfiguration. Mehrere Hashes gelten gleichzeitig, damit sich ein Schlüssel ohne Unterbrechung austauschen lässt. Ein Schlüssel in der URL wird nicht akzeptiert.
@@ -147,6 +153,7 @@ Der Dienst liest seine Konfiguration aus Umgebungsvariablen. Die vollständige L
 | `VW_MASTER_PASSWORD` | nein | Für `confirm` und `POST /v1/orgs` |
 | `VW_CA_FILE` | nein | PEM-Datei mit zusätzlichen Zertifizierungsstellen für `VW_URL` |
 | `VWSYNC_LISTEN`, `VWSYNC_TRUST_PROXY` | nein | Adresse, Vertrauen in `X-Real-IP` für die Adresse im Log |
+| `VWSYNC_LOG_FILE` | nein | Logdatei, etwa `/var/log/vwsync-api/vwsync-api.log`. Ohne sie geht das Log ins Journal |
 | `VWSYNC_LOG_LEVEL`, `VWSYNC_LOG_FORMAT` | nein | Log-Level und Format (`text` oder `json`) |
 
 ## Entwicklung

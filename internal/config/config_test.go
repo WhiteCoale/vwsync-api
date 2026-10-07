@@ -20,7 +20,7 @@ func valid(t *testing.T) {
 	} {
 		t.Setenv(k, v)
 	}
-	for _, k := range []string{"VWSYNC_LISTEN", "VWSYNC_TRUST_PROXY", "VWSYNC_LOG_LEVEL", "VWSYNC_LOG_FORMAT", "VW_MASTER_PASSWORD", "VW_CA_FILE"} {
+	for _, k := range []string{"VWSYNC_LISTEN", "VWSYNC_TRUST_PROXY", "VWSYNC_LOG_LEVEL", "VWSYNC_LOG_FORMAT", "VW_MASTER_PASSWORD", "VW_CA_FILE", "VWSYNC_LOG_FILE"} {
 		t.Setenv(k, "")
 	}
 }
@@ -113,5 +113,17 @@ func TestLogLevelRejectsOffsets(t *testing.T) {
 	t.Setenv("VWSYNC_LOG_LEVEL", "info+2")
 	if _, err := FromEnv(); err == nil {
 		t.Fatal("offset accepted")
+	}
+}
+
+func TestLogFileIsPassedThrough(t *testing.T) {
+	valid(t)
+	c, err := FromEnv()
+	if err != nil || c.LogFile != "" {
+		t.Fatalf("without VWSYNC_LOG_FILE the log goes to stderr: %q %v", c.LogFile, err)
+	}
+	t.Setenv("VWSYNC_LOG_FILE", "/var/log/vwsync-api/vwsync-api.log")
+	if c, err = FromEnv(); err != nil || c.LogFile != "/var/log/vwsync-api/vwsync-api.log" {
+		t.Fatalf("%q %v", c.LogFile, err)
 	}
 }

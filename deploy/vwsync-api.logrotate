@@ -1,0 +1,16 @@
+# logrotate-Vorlage für vwsync-api. Installieren als /etc/logrotate.d/vwsync-api.
+# Täglich rotieren, 30 Tage aufbewahren. Danach öffnet "systemctl reload" die Logdatei neu.
+/var/log/vwsync-api/*.log {
+    su vwsync vwsync
+    daily
+    rotate 30
+    missingok
+    notifempty
+    compress
+    delaycompress
+    create 0640 vwsync vwsync
+    sharedscripts
+    postrotate
+        systemctl reload vwsync-api >/dev/null 2>&1 || true
+    endscript
+}

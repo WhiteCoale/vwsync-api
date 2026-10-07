@@ -45,6 +45,17 @@ type APIError struct {
 	Body         string
 }
 
+// tokenPath ist der Login-Endpunkt von Vaultwarden.
+const tokenPath = "/identity/connect/token"
+
+// CredentialsRejected meldet, ob Vaultwarden den API-Key abgelehnt hat. Das ist ein Fehler der
+// Konfiguration und kein vorübergehendes Problem, ein erneuter Versuch ändert daran nichts.
+func CredentialsRejected(err error) bool {
+	var ae *APIError
+	return errors.As(err, &ae) && ae.Path == tokenPath &&
+		(ae.Status == http.StatusBadRequest || ae.Status == http.StatusUnauthorized)
+}
+
 func (e *APIError) Error() string {
 	if e.Status == 0 {
 		return fmt.Sprintf("%s %s failed: %s", e.Method, e.Path, e.Body)
@@ -69,6 +80,7 @@ type Client struct {
 	creds Credentials
 
 	log *slog.Logger // optional, nur für Debug-Ausgaben
+	now func() time.Time
 
 	mu      sync.Mutex // schützt die Sitzungsfelder darunter
 	token   string
@@ -80,7 +92,13 @@ type Client struct {
 }
 
 func New(httpClient *http.Client, baseURL string, creds Credentials) *Client {
-	return &Client{http: httpClient, base: strings.TrimRight(baseURL, "/"), creds: creds}
+	return &Client{http: httpClient, base: strings.TrimRight(baseURL, "/"), creds: creds, now: time.Now}
+}
+
+// Ping prüft, ob Vaultwarden antwortet. Der Endpunkt /alive braucht keine Anmeldung, der Aufruf
+// verbraucht also keinen Login.
+func (c *Client) Ping(ctx context.Context) error {
+	return c.do(ctx, "GET", "/alive", "", nil, nil, nil)
 }
 
 // WithLogger lässt den Client jeden Aufruf auf Debug-Level protokollieren, mit Methode, Pfad, Status
@@ -92,7 +110,7 @@ func (c *Client) WithLogger(l *slog.Logger) *Client {
 
 // Login liefert das Schlüsselmaterial der aktuellen Sitzung und meldet sich vorher an, falls nötig.
 func (c *Client) Login(ctx context.Context) (LoginData, error) {
-	if _, err := c.bearer(ctx, false); err != nil {
+	if _, err := c.bearer(ctx); err != nil {
 		return LoginData{}, err
 	}
 	c.mu.Lock()
@@ -299,29 +317,49 @@ func (c *Client) CreateOrganization(ctx context.Context, name, billingEmail stri
 	return model.Organization{ID: created.ID, Name: created.Name, EncryptedKey: keys.Key}, nil
 }
 
-// api ruft /api{path} auf. Ein 401 löst einen neuen Login und einen zweiten Versuch aus, weil das Token
-// abgelaufen sein kann.
+// api ruft /api{path} auf.
+//
+// Ablauf eines Tokens: bearer erneuert das Token schon 60 Sekunden vor dem gemeldeten Ablauf, ein
+// abgelaufenes Token wird also normalerweise nie gesendet. Erklärt Vaultwarden ein Token trotzdem für
+// ungültig (401), etwa nach einem Wechsel seines Signaturschlüssels, wird das Token verworfen, einmal
+// neu angemeldet und der Request einmal wiederholt. Das ist auch für schreibende Requests sicher, denn
+// bei 401 hat Vaultwarden den Request nicht verarbeitet. Scheitert auch der zweite Versuch, geht der
+// Fehler an den Aufrufer, es gibt keine Schleife.
 func (c *Client) api(ctx context.Context, method, path string, body, out any) error {
 	for attempt := 0; ; attempt++ {
-		token, err := c.bearer(ctx, attempt > 0)
+		token, err := c.bearer(ctx)
 		if err != nil {
 			return err
 		}
 		err = c.do(ctx, method, "/api"+path, token, body, nil, out)
 		var ae *APIError
 		if attempt == 0 && errors.As(err, &ae) && ae.Status == http.StatusUnauthorized {
+			c.invalidate(token)
 			continue
 		}
 		return err
 	}
 }
 
-// bearer liefert ein gültiges Access-Token. Es meldet sich an, wenn keins existiert, das vorhandene
-// bald abläuft oder force gesetzt ist.
-func (c *Client) bearer(ctx context.Context, force bool) (string, error) {
+// invalidate verwirft ein Token, das Vaultwarden abgelehnt hat. Nur wenn es noch das aktuelle ist:
+// Bekommen mehrere Requests gleichzeitig 401, meldet sich so nur der erste neu an, die anderen nutzen
+// danach dessen neues Token.
+func (c *Client) invalidate(token string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if !force && c.token != "" && time.Now().Before(c.expires) {
+	if c.token == token {
+		c.token = ""
+	}
+}
+
+// bearer liefert ein gültiges Access-Token und meldet sich an, wenn keins existiert oder das vorhandene
+// bald abläuft. Die Sperre bleibt während des Logins bestehen, damit gleichzeitige Requests nicht
+// mehrere Logins auslösen. Scheitert der Login, bleibt der Zustand unverändert, und der nächste Request
+// versucht es erneut.
+func (c *Client) bearer(ctx context.Context) (string, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.token != "" && c.now().Before(c.expires) {
 		return c.token, nil
 	}
 
@@ -336,7 +374,7 @@ func (c *Client) bearer(ctx context.Context, force bool) (string, error) {
 		"deviceIdentifier": {deviceID(c.creds.ClientID)},
 	}
 	var r map[string]json.RawMessage
-	if err := c.do(ctx, "POST", "/identity/connect/token", "", nil, form, &r); err != nil {
+	if err := c.do(ctx, "POST", tokenPath, "", nil, form, &r); err != nil {
 		return "", err
 	}
 	get := func(name string) json.RawMessage {
@@ -374,7 +412,7 @@ func (c *Client) bearer(ctx context.Context, force bool) (string, error) {
 		expiresIn = 120
 	}
 	c.token = token
-	c.expires = time.Now().Add(time.Duration(expiresIn-60) * time.Second)
+	c.expires = c.now().Add(time.Duration(expiresIn-60) * time.Second)
 	c.login = LoginData{
 		EncUserKey:    str("Key"),
 		EncPrivateKey: str("PrivateKey"),

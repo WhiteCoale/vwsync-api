@@ -1,22 +1,44 @@
 [Unit]
-Description=vwsync-api (Vaultwarden member sync REST service)
+Description=vwsync-api (Abgleich von Vaultwarden-Organisationen)
+Documentation=https://github.com/WhiteCoale/vwsync-api
 After=network-online.target
 Wants=network-online.target
+# Höchstens 10 Neustarts in 5 Minuten, danach bleibt der Dienst gestoppt und braucht einen Menschen.
+StartLimitIntervalSec=300
+StartLimitBurst=10
 
 [Service]
-Type=simple
+# Der Dienst meldet systemd per sd_notify, wann er bereit ist (READY=1), neu lädt und stoppt.
+Type=notify
+NotifyAccess=main
 User=vwsync
 Group=vwsync
 ExecStart=/opt/vwsync-api/vwsync-api serve
+# "systemctl reload" öffnet die Logdatei neu, etwa nach logrotate.
+ExecReload=/bin/kill -HUP $MAINPID
 EnvironmentFile=/etc/vwsync-api/env
+
+# Neustart bei Absturz oder Fehler, aber nicht bei Exit-Code 78: der steht für eine falsche
+# Konfiguration, und ein Neustart ändert daran nichts.
 Restart=on-failure
 RestartSec=5
-# A stop or restart waits for a running sync or confirm to finish. The service allows itself up to
-# 15 minutes for that, systemd's default of 90 seconds would kill it half way.
+RestartPreventExitStatus=78
+# Bis zu 60 Sekunden für Start und ersten Login bei Vaultwarden.
+TimeoutStartSec=60
+# Ein stop oder restart wartet auf einen laufenden Sync oder Confirm. Der Dienst gibt laufenden
+# Requests bis zu 14 Minuten, systemd wartet 15 Minuten, bevor es den Prozess hart beendet.
 TimeoutStopSec=900
+# Antwortet der Dienst 60 Sekunden lang nicht mehr auf /healthz, startet systemd ihn neu.
+WatchdogSec=60
 
-# The env file holds the API key and master password: root-owned, group vwsync, mode 0640.
-# Sandboxing. The service only needs outbound HTTPS and its own listening socket.
+# Logs: systemd legt /var/log/vwsync-api für den Benutzer vwsync an. Den Dateinamen setzt
+# VWSYNC_LOG_FILE in der env-Datei, etwa /var/log/vwsync-api/vwsync-api.log.
+LogsDirectory=vwsync-api
+LogsDirectoryMode=0750
+UMask=0027
+
+# Härtung. Der Dienst braucht nur ausgehendes HTTPS, seinen eigenen Port, den Unix-Socket für
+# sd_notify und sein Logverzeichnis.
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
@@ -24,11 +46,17 @@ PrivateTmp=true
 PrivateDevices=true
 ProtectKernelTunables=true
 ProtectKernelModules=true
+ProtectKernelLogs=true
 ProtectControlGroups=true
-RestrictAddressFamilies=AF_INET AF_INET6
+ProtectClock=true
+ProtectHostname=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
 LockPersonality=true
 MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
 SystemCallFilter=@system-service
 CapabilityBoundingSet=
 
